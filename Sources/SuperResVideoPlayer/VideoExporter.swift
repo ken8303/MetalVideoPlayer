@@ -471,7 +471,13 @@ final class VideoExporter {
                         audioDone.signal()
                         return
                     }
-                    audioInput.append(sample)
+                    if !audioInput.append(sample) {
+                        audioError = VideoExportError.processingFailed(
+                            writer.error?.localizedDescription ?? "Audio append failed.")
+                        audioInput.markAsFinished()
+                        audioDone.signal()
+                        return
+                    }
                 }
             }
         } else {

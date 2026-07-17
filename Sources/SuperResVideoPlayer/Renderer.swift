@@ -210,6 +210,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             multiplier: max(1, settings.frameInterpolationMultiplier),
             commandBuffer: commandBuffer
         ) else {
+            // No frame to show (startup, or a new file just loaded):
+            // present a clear (black) frame so stale content doesn't linger.
+            guard let drawable = view.currentDrawable,
+                  let passDescriptor = view.currentRenderPassDescriptor,
+                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+                return
+            }
+            encoder.endEncoding()
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
             return
         }
 
@@ -249,12 +259,19 @@ final class Renderer: NSObject, MTKViewDelegate {
         // mpv renders frames on its own dedicated queue; here we only pick
         // up the latest finished frame (never triggering mpv work from the
         // draw path — that caused menu-tracking deadlocks).
-        guard let frame = source.latestFrame,
-              frame.serial != lastFrameSerial,
+        guard let frame = source.latestFrame else {
+            // Engine has no frame (a new file was just loaded) — drop our
+            // history so the previous video's frames can't linger on screen.
+            previousSample = nil
+            currentSample = nil
+            return
+        }
+        guard frame.serial != lastFrameSerial,
               let texture = makeColorTexture(from: frame.pixelBuffer) else {
             return
         }
         lastFrameSerial = frame.serial
+        statReal += 1 // one count per *decoded* frame, not per display refresh
 
         if !loggedFirstFrame {
             loggedFirstFrame = true
@@ -340,6 +357,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             ) {
                 cachedInterpolation = (previous.itemTimeSeconds, current.itemTimeSeconds, t, interpolated, .metalFX)
                 lastResolvedKind = .metalFX
+                statMetalFX += 1 // counted at synthesis, not per display refresh
                 return interpolated
             }
             metalFXInterpolationUsable = frameInterpolator.isSupported
@@ -355,6 +373,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         ) {
             cachedInterpolation = (previous.itemTimeSeconds, current.itemTimeSeconds, t, warped, .warp)
             lastResolvedKind = .warp
+            statWarp += 1 // counted at synthesis, not per display refresh
             return warped
         }
 
@@ -497,17 +516,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         return true
     }
 
-    /// Accumulates per-second counts of what actually got displayed (real
-    /// decoded frames vs. MetalFX-interpolated vs. warp-interpolated) plus
-    /// input→output resolution, and pushes a one-line summary to the UI.
-    /// This is the ground truth for "are SR and interpolation really on?".
+    /// Pushes a per-second summary of unique decoded/synthesized frames
+    /// (counted where they're produced, so a paused video reads 0/0 and a
+    /// 24fps source reads ~24 real — not once per display refresh) plus
+    /// input→output resolution. This is the ground truth for "are SR and
+    /// interpolation really on?".
     private func updateStats(input: MTLTexture, output: MTLTexture, settings: RenderSettings) {
-        switch lastResolvedKind {
-        case .real: statReal += 1
-        case .metalFX: statMetalFX += 1
-        case .warp: statWarp += 1
-        }
-
         let now = CACurrentMediaTime()
         guard now - lastStatsPushTime >= 1.0 else { return }
         lastStatsPushTime = now

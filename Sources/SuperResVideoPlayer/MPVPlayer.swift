@@ -21,11 +21,14 @@ import Cmpv
 /// SR/interpolation pipeline working untouched.
 ///
 /// Threading model:
-///  - `renderNewFrameIfNeeded()`/`playbackTime` are called from the MTKView
-///    render thread (single caller — mirrors AVPlayerItemVideoOutput
-///    polling). The mpv render API requires exactly this: one render thread.
+///  - mpv's update callback fires when a frame is ready; the actual
+///    software render runs on the dedicated `renderQueue` (never on the UI
+///    or MTKView draw path — doing mpv work there deadlocked against menu
+///    tracking). The draw loop only consumes finished frames via
+///    `latestFrame`, which satisfies the render API's single-render-thread
+///    requirement.
 ///  - A dedicated event thread runs `mpv_wait_event` and forwards property
-///    changes (time/duration/EOF/errors) to the main queue via callbacks.
+///    changes (time/duration/pause/EOF/errors) to the main queue.
 ///  - The mpv client API itself (commands, get/set property) is thread-safe.
 final class MPVPlayer {
 
@@ -43,6 +46,10 @@ final class MPVPlayer {
     var onDurationChanged: ((Double) -> Void)?
     var onPlaybackEnded: (() -> Void)?
     var onError: ((String) -> Void)?
+    /// Fired when mpv's own pause state changes (including pauses mpv
+    /// initiates itself, e.g. during a buffering stall) — lets the UI's
+    /// play/pause button track reality instead of inferring it.
+    var onPauseChanged: ((Bool) -> Void)?
 
     // MARK: State
 
@@ -114,6 +121,7 @@ final class MPVPlayer {
         mpv_observe_property(handle, 0, "time-pos", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(handle, 0, "eof-reached", MPV_FORMAT_FLAG)
+        mpv_observe_property(handle, 0, "pause", MPV_FORMAT_FLAG)
 
         createRenderContext()
         startEventThread()
@@ -236,6 +244,11 @@ final class MPVPlayer {
                    raw.assumingMemoryBound(to: Int32.self).pointee != 0 {
                     DispatchQueue.main.async { [weak self] in self?.onPlaybackEnded?() }
                 }
+            case "pause":
+                if property.format == MPV_FORMAT_FLAG, let raw = property.data {
+                    let paused = raw.assumingMemoryBound(to: Int32.self).pointee != 0
+                    DispatchQueue.main.async { [weak self] in self?.onPauseChanged?(paused) }
+                }
             default:
                 break
             }
@@ -256,6 +269,12 @@ final class MPVPlayer {
     // MARK: Transport
 
     func load(url: URL) {
+        // Drop the previous video's last frame so it can't linger on
+        // screen while the new file spins up.
+        stateLock.lock()
+        _latestFrame = nil
+        stateLock.unlock()
+
         command(["loadfile", url.path, "replace"])
         setPaused(false)
     }

@@ -132,6 +132,22 @@ enum SubtitleTranslator {
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }
+            .map(stripNumberPrefix)
+    }
+
+    /// Removes a leading "N|" / "N:" / "N." (ASCII or full-width) that the
+    /// model sometimes emits with the wrong number, which the strict parser
+    /// rejects but shouldn't end up inside a subtitle.
+    private static func stripNumberPrefix(_ line: String) -> String {
+        let separators: Set<Character> = ["|", ":", ".", "｜", "：", "．", "、"]
+        var index = line.startIndex
+        while index < line.endIndex, line[index].isNumber {
+            index = line.index(after: index)
+        }
+        guard index > line.startIndex, index < line.endIndex, separators.contains(line[index]) else {
+            return line
+        }
+        return String(line[line.index(after: index)...]).trimmingCharacters(in: .whitespaces)
     }
 
     private static func makeSession(sourceName: String, targetName: String) -> LanguageModelSession {

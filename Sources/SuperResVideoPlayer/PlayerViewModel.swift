@@ -37,6 +37,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var exportProgress: Double = 0
     private var videoExporter: VideoExporter?
 
+    /// Export gets its own importer so loading a new video (which cancels
+    /// `mediaImporter` for subtitles) can't silently kill an export's
+    /// repackaging phase.
+    private var exportImporter: MediaImporter?
+
     /// Toggle for enabling/disabling MetalFX Super Resolution upscaling.
     @Published var superResolutionEnabled = true
 
@@ -135,6 +140,13 @@ final class PlayerViewModel: ObservableObject {
         }
         mpv.onPlaybackEnded = { [weak self] in
             self?.isPlaying = false
+        }
+        mpv.onPauseChanged = { [weak self] paused in
+            // Track mpv's real pause state (it can pause itself, e.g. on a
+            // buffering stall) — but only once a video is loaded, since mpv
+            // reports pause=false while idle at startup.
+            guard let self, self.currentVideoURL != nil else { return }
+            self.isPlaying = !paused
         }
         mpv.onError = { [weak self] message in
             guard let self else { return }
@@ -239,6 +251,7 @@ final class PlayerViewModel: ObservableObject {
         duration = 0
         currentVideoURL = url
         playbackErrorMessage = nil
+        statusMessage = nil // clear any status a superseded operation left behind
 
         // A new video invalidates any subtitles (and in-flight
         // transcription) generated for the previous one.
@@ -412,6 +425,8 @@ final class PlayerViewModel: ObservableObject {
         )
         let exporter = VideoExporter()
         videoExporter = exporter
+        let importer = MediaImporter()
+        exportImporter = importer
 
         // Free up decode/GPU bandwidth while exporting.
         if isPlaying { togglePlayPause() }
@@ -421,6 +436,7 @@ final class PlayerViewModel: ObservableObject {
                 self.isExportingVideo = false
                 self.statusMessage = nil
                 self.videoExporter = nil
+                self.exportImporter = nil
             }
             do {
                 var readableSource = source
@@ -428,7 +444,7 @@ final class PlayerViewModel: ObservableObject {
                 // (stream copy where possible, so this is usually fast).
                 if MediaImporter.needsAudioExtraction(source) {
                     self.statusMessage = "Repackaging video for export…"
-                    readableSource = try await self.mediaImporter.remuxVideoToMP4(from: source) { [weak self] progress in
+                    readableSource = try await importer.remuxVideoToMP4(from: source) { [weak self] progress in
                         guard let self, self.isExportingVideo else { return }
                         self.statusMessage = "Repackaging video for export… \(Int(progress * 100))%"
                     }
@@ -459,7 +475,7 @@ final class PlayerViewModel: ObservableObject {
 
     func cancelVideoExport() {
         videoExporter?.cancel()
-        mediaImporter.cancel()
+        exportImporter?.cancel()
     }
 
     /// Returns the subtitle line that should be visible at `time`, if any
