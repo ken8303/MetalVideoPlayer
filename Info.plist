@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	This Info.plist exists solely to satisfy macOS's TCC privacy-permission
+	requirement for the Speech framework (AI Subtitle Generator feature).
+	Without NSSpeechRecognitionUsageDescription present in some Info.plist
+	that ends up embedded in the built binary, calling
+	SFSpeechRecognizer.requestAuthorization terminates the process instead
+	of showing a permission prompt — this applies even to a plain command-
+	line-style executable with no .app bundle, which is what `swift build`
+	produces for this package (see Package.swift's linkerSettings, which
+	embed this file into the binary's __TEXT,__info_plist section).
+	-->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>SuperResVideoPlayer uses on-device speech recognition to generate subtitles from the audio of videos you open. Nothing is uploaded unless your Mac falls back to Apple's server-based recognition for a language that doesn't support on-device transcription.</string>
+	<!-- TODO: replace with your own reverse-DNS identifier before signing/
+	     notarizing or distributing this app to anyone else. -->
+	<key>CFBundleIdentifier</key>
+	<string>com.example.SuperResVideoPlayer</string>
+	<key>CFBundleName</key>
+	<string>SuperResVideoPlayer</string>
+	<key>CFBundleExecutable</key>
+	<string>SuperResVideoPlayer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+</dict>
+</plist>

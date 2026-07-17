@@ -1,0 +1,400 @@
+import Foundation
+import CoreVideo
+import Cmpv
+
+/// Playback engine backed by libmpv — the same engine IINA embeds — so the
+/// app plays every container/codec mpv's bundled ffmpeg supports (MKV, WebM,
+/// AVI, FLAC audio, ...) natively, with no conversion step.
+///
+/// Division of labor:
+///  - libmpv: demuxing, decoding (VideoToolbox hardware where possible),
+///    audio output, and A/V sync — all internal.
+///  - This class: pulls decoded video frames out via mpv's *software* render
+///    API into BGRA `CVPixelBuffer`s, which flow into the existing Metal
+///    pipeline (zero-copy texture wrap → MetalFX Super Resolution → frame
+///    interpolation) exactly like AVPlayerItemVideoOutput frames used to.
+///
+/// Why the software render API (not OpenGL like IINA): IINA lets mpv render
+/// straight into a view. This app instead needs each frame *as a texture* to
+/// feed MetalFX, so mpv renders into CPU-visible pixel buffers we wrap for
+/// Metal. That costs one extra copy per frame vs. IINA, in exchange for the
+/// SR/interpolation pipeline working untouched.
+///
+/// Threading model:
+///  - `renderNewFrameIfNeeded()`/`playbackTime` are called from the MTKView
+///    render thread (single caller — mirrors AVPlayerItemVideoOutput
+///    polling). The mpv render API requires exactly this: one render thread.
+///  - A dedicated event thread runs `mpv_wait_event` and forwards property
+///    changes (time/duration/EOF/errors) to the main queue via callbacks.
+///  - The mpv client API itself (commands, get/set property) is thread-safe.
+final class MPVPlayer {
+
+    /// One decoded-and-rendered video frame. `serial` increments per frame
+    /// so the renderer can cheaply detect "new frame since last draw".
+    struct Frame {
+        let pixelBuffer: CVPixelBuffer
+        let timeSeconds: Double
+        let serial: UInt64
+    }
+
+    // MARK: Callbacks (all invoked on the main queue)
+
+    var onTimeChanged: ((Double) -> Void)?
+    var onDurationChanged: ((Double) -> Void)?
+    var onPlaybackEnded: (() -> Void)?
+    var onError: ((String) -> Void)?
+
+    // MARK: State
+
+    private var handle: OpaquePointer?
+    private var renderContext: OpaquePointer?
+
+    private let stateLock = NSLock()
+    private var _latestFrame: Frame?
+    private var frameSerial: UInt64 = 0
+    private var shuttingDown = false
+    private var _pendingTimePos: Double?
+
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var poolSize: (width: Int, height: Int) = (0, 0)
+
+    /// All mpv software rendering happens on this queue — NEVER on the UI
+    /// or MTKView draw path. Rendering inside the draw callback deadlocked
+    /// the app whenever an NSMenu opened during playback (menu tracking
+    /// run-loop + per-frame mpv render/property calls vs. mpv's internal
+    /// threads). The mpv update callback enqueues work here; the draw loop
+    /// only ever picks up finished frames via `latestFrame`.
+    private let renderQueue = DispatchQueue(label: "SuperResVideoPlayer.MPVRender", qos: .userInteractive)
+
+    /// Indirection for the C update callback so that neither the callback
+    /// nor the blocks it enqueues ever hold a strong reference to the
+    /// player. The box owns the queue (queues safely outlive the player);
+    /// the player is only ever resolved through the weak reference, which
+    /// reads as nil once deinit has begun.
+    private final class WeakBox {
+        weak var player: MPVPlayer?
+        let queue: DispatchQueue
+        init(queue: DispatchQueue) { self.queue = queue }
+    }
+    private var callbackBox: Unmanaged<WeakBox>?
+
+    /// Marks renderQueue so deinit can tell whether it's already running ON
+    /// that queue (which happens when a render-queue block drops the last
+    /// reference). Calling renderQueue.sync from there would trap with
+    /// "dispatch_sync called on queue already owned by current thread".
+    private static let renderQueueKey = DispatchSpecificKey<Bool>()
+
+    // MARK: Lifecycle
+
+    init() {
+        renderQueue.setSpecific(key: Self.renderQueueKey, value: true)
+
+        guard let handle = mpv_create() else {
+            print("SuperResVideoPlayer: mpv_create failed — playback unavailable.")
+            return
+        }
+        self.handle = handle
+
+        // Options must be set before mpv_initialize.
+        mpv_set_option_string(handle, "vo", "libmpv")          // we drive rendering
+        mpv_set_option_string(handle, "hwdec", "auto-copy")    // hw decode, frames copied back for CPU access
+        mpv_set_option_string(handle, "keep-open", "yes")      // stay on last frame at EOF (matches old AVPlayer behavior)
+        mpv_set_option_string(handle, "input-default-bindings", "no")
+        mpv_set_option_string(handle, "audio-display", "no")
+        mpv_set_option_string(handle, "terminal", "no")
+        mpv_set_option_string(handle, "msg-level", "all=warn")
+
+        guard mpv_initialize(handle) >= 0 else {
+            print("SuperResVideoPlayer: mpv_initialize failed — playback unavailable.")
+            mpv_terminate_destroy(handle)
+            self.handle = nil
+            return
+        }
+
+        mpv_observe_property(handle, 0, "time-pos", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(handle, 0, "eof-reached", MPV_FORMAT_FLAG)
+
+        createRenderContext()
+        startEventThread()
+    }
+
+    deinit {
+        stateLock.lock()
+        shuttingDown = true
+        let context = renderContext
+        renderContext = nil
+        stateLock.unlock()
+
+        // The render context must be freed before the handle is destroyed,
+        // and only after any in-flight render on renderQueue has drained.
+        // If deinit is itself running ON renderQueue (a render-queue block
+        // dropped the last reference), the queue is serial so nothing else
+        // can be mid-render — and a sync here would deadlock-trap.
+        if let context {
+            mpv_render_context_set_update_callback(context, nil, nil)
+            if DispatchQueue.getSpecific(key: Self.renderQueueKey) != true {
+                renderQueue.sync { }
+            }
+            mpv_render_context_free(context)
+        }
+        callbackBox?.release()
+        if handle != nil {
+            // The event thread sees MPV_EVENT_SHUTDOWN and calls
+            // mpv_terminate_destroy — the documented teardown pattern.
+            command(["quit"])
+        }
+    }
+
+    private func createRenderContext() {
+        guard let handle else { return }
+        var context: OpaquePointer?
+        let status = "sw".withCString { apiType -> Int32 in
+            var params = [
+                mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
+                                 data: UnsafeMutableRawPointer(mutating: apiType)),
+                mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil)
+            ]
+            return mpv_render_context_create(&context, handle, &params)
+        }
+        guard status >= 0, let context else {
+            print("SuperResVideoPlayer: mpv_render_context_create failed (\(status)) — no video output.")
+            return
+        }
+        renderContext = context
+
+        // mpv tells us when a new frame is ready; render it on our
+        // dedicated queue. Neither the callback nor the enqueued block may
+        // retain self — a block holding the last reference would run
+        // deinit on the render queue (see WeakBox/renderQueueKey).
+        let box = WeakBox(queue: renderQueue)
+        box.player = self
+        let retainedBox = Unmanaged.passRetained(box)
+        callbackBox = retainedBox
+        mpv_render_context_set_update_callback(context, { userdata in
+            guard let userdata else { return }
+            let box = Unmanaged<WeakBox>.fromOpaque(userdata).takeUnretainedValue()
+            box.queue.async { box.player?.renderNewFrame() }
+        }, retainedBox.toOpaque())
+    }
+
+    // MARK: Event loop
+
+    private func startEventThread() {
+        guard let handle else { return }
+        let thread = Thread { [weak self] in
+            while true {
+                guard let event = mpv_wait_event(handle, -1) else { continue }
+                if event.pointee.event_id == MPV_EVENT_SHUTDOWN {
+                    mpv_terminate_destroy(handle)
+                    return
+                }
+                self?.handleEvent(event)
+            }
+        }
+        thread.name = "SuperResVideoPlayer.MPVEvents"
+        thread.start()
+    }
+
+    private func handleEvent(_ event: UnsafeMutablePointer<mpv_event>) {
+        switch event.pointee.event_id {
+        case MPV_EVENT_PROPERTY_CHANGE:
+            guard let data = event.pointee.data else { return }
+            let property = data.assumingMemoryBound(to: mpv_event_property.self).pointee
+            let name = String(cString: property.name)
+
+            switch name {
+            case "time-pos":
+                if property.format == MPV_FORMAT_DOUBLE, let raw = property.data {
+                    let seconds = raw.assumingMemoryBound(to: Double.self).pointee
+                    // Coalesce: mpv emits this many times per second, and
+                    // main-queue blocks pile up while a menu is being
+                    // tracked. Keep at most one dispatch in flight, always
+                    // delivering the newest value.
+                    stateLock.lock()
+                    let alreadyScheduled = _pendingTimePos != nil
+                    _pendingTimePos = seconds
+                    stateLock.unlock()
+                    if !alreadyScheduled {
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            self.stateLock.lock()
+                            let latest = self._pendingTimePos
+                            self._pendingTimePos = nil
+                            self.stateLock.unlock()
+                            if let latest { self.onTimeChanged?(latest) }
+                        }
+                    }
+                }
+            case "duration":
+                if property.format == MPV_FORMAT_DOUBLE, let raw = property.data {
+                    let seconds = raw.assumingMemoryBound(to: Double.self).pointee
+                    DispatchQueue.main.async { [weak self] in self?.onDurationChanged?(seconds) }
+                }
+            case "eof-reached":
+                if property.format == MPV_FORMAT_FLAG, let raw = property.data,
+                   raw.assumingMemoryBound(to: Int32.self).pointee != 0 {
+                    DispatchQueue.main.async { [weak self] in self?.onPlaybackEnded?() }
+                }
+            default:
+                break
+            }
+
+        case MPV_EVENT_END_FILE:
+            guard let data = event.pointee.data else { return }
+            let endFile = data.assumingMemoryBound(to: mpv_event_end_file.self).pointee
+            if endFile.reason == MPV_END_FILE_REASON_ERROR {
+                let message = String(cString: mpv_error_string(endFile.error))
+                DispatchQueue.main.async { [weak self] in self?.onError?(message) }
+            }
+
+        default:
+            break
+        }
+    }
+
+    // MARK: Transport
+
+    func load(url: URL) {
+        command(["loadfile", url.path, "replace"])
+        setPaused(false)
+    }
+
+    func setPaused(_ paused: Bool) {
+        guard let handle else { return }
+        var flag: Int32 = paused ? 1 : 0
+        mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
+    }
+
+    func seek(to seconds: Double) {
+        command(["seek", String(seconds), "absolute+exact"])
+    }
+
+    /// Current playback position in seconds. Thread-safe; used by the
+    /// renderer every draw to compute the interpolation phase.
+    var playbackTime: Double {
+        getDouble("time-pos") ?? 0
+    }
+
+    // MARK: Frame output
+
+    /// Runs exclusively on `renderQueue` (triggered by mpv's update
+    /// callback). If mpv has a new video frame ready, software-renders it
+    /// into a fresh BGRA CVPixelBuffer and publishes it via `latestFrame`,
+    /// which the Metal draw loop consumes without doing any mpv work itself.
+    private func renderNewFrame() {
+        stateLock.lock()
+        let context = renderContext
+        let isShuttingDown = shuttingDown
+        stateLock.unlock()
+        guard let context, !isShuttingDown else { return }
+
+        let flags = mpv_render_context_update(context)
+        guard flags & UInt64(MPV_RENDER_UPDATE_FRAME.rawValue) != 0 else {
+            return
+        }
+
+        let width = Int(getInt64("dwidth") ?? 0)
+        let height = Int(getInt64("dheight") ?? 0)
+        guard width > 0, height > 0 else { return }
+
+        if pixelBufferPool == nil || poolSize != (width, height) {
+            rebuildPixelBufferPool(width: width, height: height)
+        }
+        guard let pool = pixelBufferPool else { return }
+
+        var newBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &newBuffer) == kCVReturnSuccess,
+              let pixelBuffer = newBuffer else {
+            return
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+
+        var size: [Int32] = [Int32(width), Int32(height)]
+        var stride: Int = CVPixelBufferGetBytesPerRow(pixelBuffer)
+
+        // "bgr0" = byte order B,G,R,unused — matches kCVPixelFormatType_32BGRA
+        // (the alpha byte is ignored downstream; the video pipeline never blends).
+        let status = "bgr0".withCString { format -> Int32 in
+            size.withUnsafeMutableBufferPointer { sizePointer in
+                withUnsafeMutablePointer(to: &stride) { stridePointer -> Int32 in
+                    var params = [
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE,
+                                         data: UnsafeMutableRawPointer(sizePointer.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT,
+                                         data: UnsafeMutableRawPointer(mutating: format)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE,
+                                         data: UnsafeMutableRawPointer(stridePointer)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER,
+                                         data: baseAddress),
+                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil)
+                    ]
+                    return mpv_render_context_render(context, &params)
+                }
+            }
+        }
+        guard status >= 0 else { return }
+
+        let timeSeconds = getDoubleUnlocked("time-pos") ?? 0
+        stateLock.lock()
+        frameSerial &+= 1
+        _latestFrame = Frame(pixelBuffer: pixelBuffer,
+                             timeSeconds: timeSeconds,
+                             serial: frameSerial)
+        stateLock.unlock()
+    }
+
+    /// Most recently rendered frame; consumed by the Metal draw loop.
+    /// Thread-safe.
+    var latestFrame: Frame? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _latestFrame
+    }
+
+    private func rebuildPixelBufferPool(width: Int, height: Int) {
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pool)
+        pixelBufferPool = pool
+        poolSize = (width, height)
+    }
+
+    // MARK: Property/command plumbing
+
+    private func command(_ args: [String]) {
+        guard let handle else { return }
+        let cStrings = args.map { strdup($0) }
+        defer { cStrings.forEach { free($0) } }
+        var argv: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
+        argv.append(nil)
+        mpv_command(handle, &argv)
+    }
+
+    private func getDouble(_ name: String) -> Double? {
+        getDoubleUnlocked(name)
+    }
+
+    private func getDoubleUnlocked(_ name: String) -> Double? {
+        guard let handle else { return nil }
+        var value: Double = 0
+        guard mpv_get_property(handle, name, MPV_FORMAT_DOUBLE, &value) >= 0 else { return nil }
+        return value
+    }
+
+    private func getInt64(_ name: String) -> Int64? {
+        guard let handle else { return nil }
+        var value: Int64 = 0
+        guard mpv_get_property(handle, name, MPV_FORMAT_INT64, &value) >= 0 else { return nil }
+        return value
+    }
+}
