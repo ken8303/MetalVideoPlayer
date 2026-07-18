@@ -7,6 +7,15 @@ real time:
   ffmpeg understands, via an embedded **libmpv** engine (the same engine
   that powers [IINA](https://github.com/iina/iina) and mpv). No conversion,
   no transcoding.
+- **AI Image Enhancer** — clean up and reconstruct detail *without changing
+  resolution*, applied before Super Resolution. Three engines:
+  - **Classic** — one compute pass: edge-aware denoise + contrast-adaptive
+    sharpening. Near-free, realtime.
+  - **Neural** — MetalFX ML scaler reconstructs at 2x, then Lanczos
+    resamples back to native (supersampling). Realtime on Apple Silicon.
+  - **Max** — Real-ESRGAN (`realesr-animevideov3`) via Core ML, **export
+    only** (too heavy for live playback). One-time install:
+    `bash convert-model.sh`.
 - **Super Resolution** — real-time upscaling (1.3x / 1.5x / 2.0x) with
   Apple's **MetalFX Spatial Scaler**.
 - **AI Frame Interpolation** — 2x/3x motion smoothing: Vision optical flow
@@ -45,6 +54,11 @@ real time:
   never needs it.
 - Subtitle translation requires **Apple Intelligence** to be enabled
   (System Settings > Apple Intelligence & Siri).
+- The **Max** image-enhancer engine requires the Real-ESRGAN Core ML model.
+  Install it once with `bash convert-model.sh` (needs `python3`; downloads
+  the ~2.4 MB weights and converts them into
+  `~/Library/Application Support/SuperResVideoPlayer/RealESRGAN.mlpackage`).
+  Without it, Classic and Neural still work.
 
 ## Build & run
 
@@ -126,6 +140,8 @@ Package.swift                 — SPM manifest (Cmpv system library + executable
 Info.plist                    — bundle metadata + TCC usage strings
 make-app.sh                   — debug build → minimal .app → run
 make-dist.sh                  — release build → self-contained shareable .app/.zip
+convert-model.sh              — one-time Real-ESRGAN → Core ML install (Max engine)
+convert_model.py              — SRVGGNetCompact → .mlpackage conversion
 Sources/Cmpv/                 — libmpv module map (pkg-config: mpv)
 Sources/SuperResVideoPlayer/
   SuperResVideoPlayerApp.swift — @main; foreground-app activation
@@ -136,7 +152,9 @@ Sources/SuperResVideoPlayer/
   Renderer.swift               — frame history, interpolation routing, SR, stats, draw
   FrameInterpolator.swift      — MTLFXFrameInterpolator wrapper (2x midpoints)
   OpticalFlow.swift            — Vision optical flow → Metal motion texture (playback)
-  Shaders.metal                — blit shaders + clear-depth/warp-blend kernels
+  Shaders.metal                — blit shaders + enhance/clear-depth/warp-blend kernels
+  EnhancementProcessor.swift   — Image Enhancer: Classic + Neural (MetalFX) engines
+  NeuralEnhancer.swift         — Image Enhancer: Max engine (Real-ESRGAN via Core ML)
   SubtitleGenerator.swift      — SpeechAnalyzer (+ legacy fallback) → cues
   SubtitleTranslator.swift     — Apple Intelligence batch translation
   SubtitleCue.swift            — cue model + .srt formatting
@@ -150,3 +168,8 @@ The source in this repository is the author's. Binary distributions built
 with `make-dist.sh` bundle [mpv/libmpv](https://mpv.io) and
 [FFmpeg](https://ffmpeg.org) (Homebrew builds, GPL-enabled) — if you
 redistribute the bundled app, GPL obligations apply to those components.
+
+The **Max** engine uses the [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
+`realesr-animevideov3` model (BSD-3-Clause, Xintao Wang et al.). The model
+is downloaded/converted locally by `convert-model.sh` and is **not**
+included in this repository or in `make-dist.sh` bundles.

@@ -3,6 +3,14 @@ import Combine
 import UniformTypeIdentifiers
 import Speech
 
+/// Which implementation the AI Image Enhancer uses.
+enum EnhancerEngine: String, CaseIterable, Identifiable {
+    case classic   // adaptive denoise + sharpen kernel (cheapest)
+    case neural    // MetalFX ML supersample (2x reconstruct → Lanczos back)
+    case max       // Real-ESRGAN via Core ML — export only; playback previews with .neural
+    var id: String { rawValue }
+}
+
 /// Owns the libmpv playback engine (`MPVPlayer`), exposes playback state to
 /// SwiftUI, and vends decoded video frames to the Metal renderer. mpv plays
 /// every container/codec its bundled ffmpeg supports (MKV, WebM, FLAC, ...)
@@ -41,6 +49,12 @@ final class PlayerViewModel: ObservableObject {
     /// `mediaImporter` for subtitles) can't silently kill an export's
     /// repackaging phase.
     private var exportImporter: MediaImporter?
+
+    /// AI Image Enhancer: same-resolution cleanup applied before Super
+    /// Resolution. See `EnhancerEngine` for the three implementations.
+    @Published var imageEnhancementEnabled = false
+    @Published var enhancementEngine: EnhancerEngine = .classic
+    @Published var enhancementStrength: Double = 0.5
 
     /// Toggle for enabling/disabling MetalFX Super Resolution upscaling.
     @Published var superResolutionEnabled = true
@@ -398,22 +412,30 @@ final class PlayerViewModel: ObservableObject {
 
     /// Prompts for a destination, then re-renders the whole video offline
     /// with the current Super Resolution / frame interpolation settings.
-    func exportEnhancedVideo() {
+    /// `durationLimit` (seconds) caps the render — used by the test export
+    /// to preview the current engine settings quickly.
+    func exportEnhancedVideo(durationLimit: Double? = nil) {
         guard let source = currentVideoURL, !isExportingVideo else { return }
 
         let panel = NSSavePanel()
-        panel.title = "Export Enhanced Video"
         let baseName = (videoTitle as NSString).deletingPathExtension
-        panel.nameFieldStringValue = baseName.isEmpty ? "Enhanced.mp4" : "\(baseName) (enhanced).mp4"
+        let stem = baseName.isEmpty ? "Enhanced" : baseName
+        if let durationLimit {
+            panel.title = "Export Test Clip (\(Int(durationLimit))s)"
+            panel.nameFieldStringValue = "\(stem) (test).mp4"
+        } else {
+            panel.title = "Export Enhanced Video"
+            panel.nameFieldStringValue = "\(stem) (enhanced).mp4"
+        }
         panel.allowedContentTypes = [.mpeg4Movie]
 
         panel.begin { [weak self] response in
             guard let self, response == .OK, let destination = panel.url else { return }
-            self.startVideoExport(source: source, destination: destination)
+            self.startVideoExport(source: source, destination: destination, durationLimit: durationLimit)
         }
     }
 
-    private func startVideoExport(source: URL, destination: URL) {
+    private func startVideoExport(source: URL, destination: URL, durationLimit: Double? = nil) {
         isExportingVideo = true
         exportProgress = 0
         playbackErrorMessage = nil
@@ -421,7 +443,11 @@ final class PlayerViewModel: ObservableObject {
         let configuration = VideoExporter.Configuration(
             superResolutionEnabled: superResolutionEnabled,
             upscaleFactor: upscaleFactor,
-            frameInterpolationMultiplier: frameInterpolationMultiplier
+            frameInterpolationMultiplier: frameInterpolationMultiplier,
+            imageEnhancementEnabled: imageEnhancementEnabled,
+            enhancementEngine: enhancementEngine,
+            enhancementStrength: enhancementStrength,
+            durationLimitSeconds: durationLimit
         )
         let exporter = VideoExporter()
         videoExporter = exporter

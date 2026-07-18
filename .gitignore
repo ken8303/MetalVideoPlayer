@@ -10,3 +10,9 @@ DerivedData/
 
 # macOS
 .DS_Store
+
+# Model conversion artifacts (see convert-model.sh)
+.model-venv/
+*.pth
+*.mlpackage
+*.mlmodelc

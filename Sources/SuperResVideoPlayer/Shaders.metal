@@ -34,6 +34,75 @@ fragment float4 videoFragmentShader(VertexOut in [[stage_in]],
     return videoTexture.sample(s, in.uv);
 }
 
+// MARK: - AI Image Enhancer
+
+struct EnhanceParams {
+    float sharpness;   // 0..1
+    float denoise;     // 0..1
+};
+
+/// Same-resolution image enhancement: a light edge-aware denoise followed by
+/// contrast-adaptive sharpening (CAS-style, after AMD FidelityFX). The
+/// sharpening strength adapts per pixel to local contrast, so already-crisp
+/// edges aren't over-driven into halos while soft detail gets lifted —
+/// "cleaner and more detailed without changing the resolution". Runs before
+/// Super Resolution so the upscaler receives the improved image.
+kernel void enhanceKernel(texture2d<float, access::sample> inputTexture [[texture(0)]],
+                           texture2d<float, access::write> outputTexture [[texture(1)]],
+                           constant EnhanceParams &params [[buffer(0)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint width = outputTexture.get_width();
+    uint height = outputTexture.get_height();
+    if (gid.x >= width || gid.y >= height) {
+        return;
+    }
+
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 texSize = float2(width, height);
+    float2 uv = (float2(gid) + 0.5) / texSize;
+    float2 px = 1.0 / texSize;
+
+    // 3x3 neighborhood.
+    float3 a = inputTexture.sample(s, uv + float2(-px.x, -px.y)).rgb;
+    float3 b = inputTexture.sample(s, uv + float2( 0.0,  -px.y)).rgb;
+    float3 c = inputTexture.sample(s, uv + float2( px.x, -px.y)).rgb;
+    float3 d = inputTexture.sample(s, uv + float2(-px.x,  0.0)).rgb;
+    float3 e = inputTexture.sample(s, uv).rgb;
+    float3 f = inputTexture.sample(s, uv + float2( px.x,  0.0)).rgb;
+    float3 g = inputTexture.sample(s, uv + float2(-px.x,  px.y)).rgb;
+    float3 h = inputTexture.sample(s, uv + float2( 0.0,   px.y)).rgb;
+    float3 i = inputTexture.sample(s, uv + float2( px.x,  px.y)).rgb;
+
+    // Light edge-aware denoise: blend toward the cross average only in
+    // flat regions (high local range = edge = leave untouched). Cleans up
+    // compression noise/mosquito artifacts without smearing detail.
+    float3 crossAvg = (b + d + f + h) * 0.25;
+    float3 range = max(max(max(b, d), max(f, h)), e) - min(min(min(b, d), min(f, h)), e);
+    float flatness = 1.0 - saturate(dot(range, float3(1.0 / 3.0)) * 8.0);
+    float3 base = mix(e, crossAvg, params.denoise * flatness * 0.6);
+
+    // Contrast-adaptive sharpening (CAS). The negative-lobe weight scales
+    // with sqrt of local headroom, limiting ringing at strong edges.
+    float3 mnRGB = min(min(min(d, e), min(f, b)), h);
+    float3 mxRGB = max(max(max(d, e), max(f, b)), h);
+    float3 mnRGB2 = min(mnRGB, min(min(a, c), min(g, i)));
+    float3 mxRGB2 = max(mxRGB, max(max(a, c), max(g, i)));
+    mnRGB += mnRGB2;
+    mxRGB += mxRGB2;
+
+    float3 rcpM = 1.0 / (mxRGB + 1e-4);
+    float3 amp = sqrt(saturate(min(mnRGB, 2.0 - mxRGB) * rcpM));
+
+    // Lobe strength: -1/8 (mild) .. -1/5 (strong) with the slider.
+    float peak = -1.0 / mix(8.0, 5.0, saturate(params.sharpness));
+    float3 w = amp * peak;
+    float3 rcpW = 1.0 / (1.0 + 4.0 * w);
+    float3 sharpened = saturate(((b + d + f + h) * w + base) * rcpW);
+
+    float3 result = mix(base, sharpened, saturate(params.sharpness));
+    outputTexture.write(float4(result, 1.0), gid);
+}
+
 // MARK: - Frame interpolation support kernels
 
 /// Fills a texture with a flat/constant depth value. Video frames have no

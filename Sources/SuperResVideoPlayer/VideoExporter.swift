@@ -41,6 +41,12 @@ final class VideoExporter {
         var superResolutionEnabled: Bool
         var upscaleFactor: Double
         var frameInterpolationMultiplier: Int
+        var imageEnhancementEnabled: Bool
+        var enhancementEngine: EnhancerEngine
+        var enhancementStrength: Double
+        /// If set, stop after this many seconds of source video — used by
+        /// the "test export" to compare engines without a full render.
+        var durationLimitSeconds: Double?
     }
 
     private let workQueue = DispatchQueue(label: "SuperResVideoPlayer.VideoExport", qos: .userInitiated)
@@ -102,7 +108,8 @@ final class VideoExporter {
         guard let clearFn = library.makeFunction(name: "clearDepthKernel"),
               let warpFn = library.makeFunction(name: "warpBlendKernel"),
               let clearPipeline = try? device.makeComputePipelineState(function: clearFn),
-              let warpPipeline = try? device.makeComputePipelineState(function: warpFn) else {
+              let warpPipeline = try? device.makeComputePipelineState(function: warpFn),
+              let enhancer = EnhancementProcessor(device: device, library: library) else {
             throw VideoExportError.processingFailed("Couldn't build the compute pipelines.")
         }
 
@@ -119,7 +126,9 @@ final class VideoExporter {
             throw VideoExportError.unreadableSource("No video track found.")
         }
         let audioTrack = asset.tracks(withMediaType: .audio).first
-        let duration = asset.duration.seconds
+        let fullDuration = asset.duration.seconds
+        // Progress is measured against the (possibly capped) export length.
+        let duration = min(fullDuration, configuration.durationLimitSeconds ?? fullDuration)
         let sourceFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30)
 
         guard let reader = try? AVAssetReader(asset: asset) else {
@@ -165,6 +174,15 @@ final class VideoExporter {
         var spatialScaler: MTLFXSpatialScaler?
         var scalerOutput: MTLTexture?
         var warpOutput: MTLTexture?
+
+        // "Max" engine (Real-ESRGAN via Core ML), export-only. Fails fast
+        // here — before any decoding — if the model isn't installed.
+        var maxEnhancer: NeuralEnhancer?
+        if configuration.imageEnhancementEnabled,
+           configuration.enhancementStrength > 0,
+           configuration.enhancementEngine == .max {
+            maxEnhancer = try NeuralEnhancer(device: device)
+        }
 
         var outWidth = inputWidth
         var outHeight = inputHeight
@@ -255,6 +273,21 @@ final class VideoExporter {
             )
             guard status == kCVReturnSuccess, let cvTexture else { return nil }
             return CVMetalTextureGetTexture(cvTexture)
+        }
+
+        func enhanceIfNeeded(_ texture: MTLTexture, commandBuffer: MTLCommandBuffer) throws -> MTLTexture {
+            guard configuration.imageEnhancementEnabled, configuration.enhancementStrength > 0 else {
+                return texture
+            }
+            if let maxEnhancer {
+                // Real-ESRGAN runs synchronously on its own queue; its
+                // output then flows into this command buffer's SR pass.
+                return try maxEnhancer.enhance(texture)
+            }
+            return enhancer.process(texture,
+                                    neural: configuration.enhancementEngine == .neural,
+                                    strength: configuration.enhancementStrength,
+                                    commandBuffer: commandBuffer) ?? texture
         }
 
         func upscaleIfNeeded(_ texture: MTLTexture, commandBuffer: MTLCommandBuffer) -> MTLTexture {
@@ -375,7 +408,8 @@ final class VideoExporter {
                             commandBuffer.commit()
                             continue
                         }
-                        let finalTexture = upscaleIfNeeded(synthTexture, commandBuffer: commandBuffer)
+                        let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(synthTexture, commandBuffer: commandBuffer),
+                                                           commandBuffer: commandBuffer)
                         let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
                         staged.append((outBuffer, prev.pts + CMTimeMultiplyByFloat64(span, multiplier: t)))
                         synthFrames += 1
@@ -385,7 +419,8 @@ final class VideoExporter {
             }
 
             guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
-            let finalTexture = upscaleIfNeeded(texture, commandBuffer: commandBuffer)
+            let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(texture, commandBuffer: commandBuffer),
+                                               commandBuffer: commandBuffer)
             let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
             staged.append((outBuffer, pts))
 
@@ -434,6 +469,14 @@ final class VideoExporter {
                     } else {
                         sample = videoOutput.copyNextSampleBuffer()
                     }
+                    // Test export: stop once we've passed the time cap.
+                    if let sample, let limit = configuration.durationLimitSeconds,
+                       CMSampleBufferGetPresentationTimeStamp(sample).seconds > limit {
+                        videoFinished = true
+                        videoInput.markAsFinished()
+                        videoDone.signal()
+                        return
+                    }
                     guard let sample else {
                         videoFinished = true
                         videoInput.markAsFinished()
@@ -466,7 +509,15 @@ final class VideoExporter {
                         audioDone.signal()
                         return
                     }
-                    guard let sample = audioOutput.copyNextSampleBuffer() else {
+                    let sample = audioOutput.copyNextSampleBuffer()
+                    // Match the video time cap for test exports.
+                    if let sample, let limit = configuration.durationLimitSeconds,
+                       CMSampleBufferGetPresentationTimeStamp(sample).seconds > limit {
+                        audioInput.markAsFinished()
+                        audioDone.signal()
+                        return
+                    }
+                    guard let sample else {
                         audioInput.markAsFinished()
                         audioDone.signal()
                         return

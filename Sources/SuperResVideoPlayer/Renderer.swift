@@ -25,6 +25,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var warpBlendPipelineState: MTLComputePipelineState!
     private var textureCache: CVMetalTextureCache!
 
+    // MARK: AI Image Enhancer (shared implementation with VideoExporter)
+    private var enhancementProcessor: EnhancementProcessor?
+
     private weak var playerViewModel: PlayerViewModel?
 
     // MARK: Thread-safe snapshot of UI state
@@ -38,6 +41,9 @@ final class Renderer: NSObject, MTKViewDelegate {
         var superResolutionEnabled = true
         var upscaleFactor: Double = 1.5
         var frameInterpolationMultiplier = 1
+        var imageEnhancementEnabled = false
+        var enhancementUsesNeural = false
+        var enhancementStrength: Double = 0.5
         var frameSource: MPVPlayer?
     }
     private let settingsLock = NSLock()
@@ -50,6 +56,11 @@ final class Renderer: NSObject, MTKViewDelegate {
             superResolutionEnabled: viewModel.superResolutionEnabled,
             upscaleFactor: viewModel.upscaleFactor,
             frameInterpolationMultiplier: viewModel.frameInterpolationMultiplier,
+            imageEnhancementEnabled: viewModel.imageEnhancementEnabled,
+            // .max is export-only (Core ML, ~100ms+/frame); playback
+            // previews it with the MetalFX neural path.
+            enhancementUsesNeural: viewModel.enhancementEngine != .classic,
+            enhancementStrength: viewModel.enhancementStrength,
             frameSource: viewModel.mpv
         )
         settingsLock.lock()
@@ -186,6 +197,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         } catch {
             fatalError("SuperResVideoPlayer: failed to build compute pipeline states: \(error)")
         }
+
+        enhancementProcessor = EnhancementProcessor(device: device, library: library)
     }
 
     // MARK: MTKViewDelegate
@@ -225,8 +238,20 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         var textureToDisplay: MTLTexture = frameTexture
 
+        // AI Image Enhancer: same-resolution denoise + adaptive sharpen,
+        // applied before Super Resolution so the upscaler gets the cleaner
+        // image.
+        if settings.imageEnhancementEnabled, settings.enhancementStrength > 0 {
+            if let enhanced = enhancementProcessor?.process(frameTexture,
+                                                            neural: settings.enhancementUsesNeural,
+                                                            strength: settings.enhancementStrength,
+                                                            commandBuffer: commandBuffer) {
+                textureToDisplay = enhanced
+            }
+        }
+
         if settings.superResolutionEnabled, metalFXUpscaleSupported {
-            if let upscaled = upscale(frameTexture,
+            if let upscaled = upscale(textureToDisplay,
                                        factor: settings.upscaleFactor,
                                        commandBuffer: commandBuffer) {
                 textureToDisplay = upscaled
@@ -547,7 +572,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             smoothing = "off"
         }
 
-        let text = "\(input.width)×\(input.height) → \(output.width)×\(output.height) · Super Res: \(sr) · Smoothing: \(smoothing)"
+        let enhance: String
+        if settings.imageEnhancementEnabled {
+            let engine = settings.enhancementUsesNeural
+                ? ((enhancementProcessor?.neuralSupported ?? false) ? "Neural" : "Classic*")
+                : "Classic"
+            enhance = String(format: "%@ %.0f%%", engine, settings.enhancementStrength * 100)
+        } else {
+            enhance = "off"
+        }
+        let text = "\(input.width)×\(input.height) → \(output.width)×\(output.height) · Enhance: \(enhance) · Super Res: \(sr) · Smoothing: \(smoothing)"
         statReal = 0
         statMetalFX = 0
         statWarp = 0

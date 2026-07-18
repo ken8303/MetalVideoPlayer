@@ -57,6 +57,12 @@ struct ContentView: View {
                         playerViewModel.cancelVideoExport()
                     }
                 } else {
+                    Button("Test 10s") {
+                        playerViewModel.exportEnhancedVideo(durationLimit: 10)
+                    }
+                    .disabled(playerViewModel.duration == 0)
+                    .help("Export just the first 10 seconds — quick way to compare enhancer engines.")
+
                     Button("Export Video…") {
                         playerViewModel.exportEnhancedVideo()
                     }
@@ -103,6 +109,38 @@ struct ContentView: View {
             }
 
             Divider()
+
+            HStack {
+                Toggle("AI Image Enhancer", isOn: $playerViewModel.imageEnhancementEnabled)
+
+                Spacer()
+
+                Picker("Engine", selection: $playerViewModel.enhancementEngine) {
+                    Text("Classic").tag(EnhancerEngine.classic)
+                    Text("Neural").tag(EnhancerEngine.neural)
+                    Text("Max").tag(EnhancerEngine.max)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 190)
+                .disabled(!playerViewModel.imageEnhancementEnabled)
+
+                Slider(value: $playerViewModel.enhancementStrength, in: 0...1)
+                    .frame(width: 110)
+                    .disabled(!playerViewModel.imageEnhancementEnabled)
+                Text("\(Int(playerViewModel.enhancementStrength * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 36, alignment: .trailing)
+            }
+
+            if playerViewModel.imageEnhancementEnabled && playerViewModel.enhancementEngine == .max {
+                Text(NeuralEnhancer.isModelAvailable
+                     ? "Max (Real-ESRGAN) applies during export — playback previews with the Neural engine."
+                     : "Max needs the Real-ESRGAN model: run `bash convert-model.sh` once to install it.")
+                    .font(.caption)
+                    .foregroundStyle(NeuralEnhancer.isModelAvailable ? Color.secondary : Color.orange)
+            }
 
             HStack {
                 Toggle("Super Resolution", isOn: $playerViewModel.superResolutionEnabled)
