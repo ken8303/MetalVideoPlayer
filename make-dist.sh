@@ -18,7 +18,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "==> Building (release)…"
-swift build -c release
+# -gnone skips the dsymutil step some Macs block (see make-app.sh); a
+# shipped binary doesn't need a dSYM anyway.
+swift build -c release -Xswiftc -gnone
 
 BIN=.build/release/SuperResVideoPlayer
 BUNDLE_SRC=.build/release/SuperResVideoPlayer_SuperResVideoPlayer.bundle

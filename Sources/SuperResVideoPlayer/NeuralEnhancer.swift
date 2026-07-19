@@ -1,6 +1,5 @@
 import CoreML
 import Metal
-import MetalPerformanceShaders
 import CoreVideo
 
 /// The "Max" image-enhancer engine: Real-ESRGAN (realesr-animevideov3)
@@ -34,7 +33,7 @@ final class NeuralEnhancer {
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private let lanczos: MPSImageLanczosScale
+    private let downsamplePipeline: MTLComputePipelineState
     private let model: MLModel
     private let inputName: String
     private let outputName: String
@@ -54,9 +53,14 @@ final class NeuralEnhancer {
         guard let queue = device.makeCommandQueue() else {
             throw VideoExportError.processingFailed("Couldn't create a Metal queue for the Max engine.")
         }
+        let library = Renderer.loadShaderLibrary(device: device)
+        guard let downsampleFn = library.makeFunction(name: "downsampleKernel"),
+              let downsample = try? device.makeComputePipelineState(function: downsampleFn) else {
+            throw VideoExportError.processingFailed("Couldn't build the downsample pipeline for the Max engine.")
+        }
         self.device = device
         self.commandQueue = queue
-        self.lanczos = MPSImageLanczosScale(device: device)
+        self.downsamplePipeline = downsample
 
         // Compile (fast for this ~2 MB model) and load, preferring the ANE.
         let compiled = try MLModel.compileModel(at: Self.modelPackageURL)
@@ -152,12 +156,17 @@ final class NeuralEnhancer {
 
                 // 3. Resample the 4x tile straight back to tile size, then
                 //    stitch the interior into the output.
-                guard let finishBuffer = commandQueue.makeCommandBuffer() else {
+                guard let finishBuffer = commandQueue.makeCommandBuffer(),
+                      let downEncoder = finishBuffer.makeComputeCommandEncoder() else {
                     throw VideoExportError.processingFailed("Max engine: command buffer failed.")
                 }
-                lanczos.encode(commandBuffer: finishBuffer,
-                               sourceTexture: enhancedTexture,
-                               destinationTexture: tileDownTexture)
+                downEncoder.setComputePipelineState(downsamplePipeline)
+                downEncoder.setTexture(enhancedTexture, index: 0)
+                downEncoder.setTexture(tileDownTexture, index: 1)
+                let dsGroup = MTLSize(width: 16, height: 16, depth: 1)
+                let dsGrid = MTLSize(width: (tileSize + 15) / 16, height: (tileSize + 15) / 16, depth: 1)
+                downEncoder.dispatchThreadgroups(dsGrid, threadsPerThreadgroup: dsGroup)
+                downEncoder.endEncoding()
                 if let stitch = finishBuffer.makeBlitCommandEncoder() {
                     let innerX = tileX - srcX
                     let innerY = tileY - srcY

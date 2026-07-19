@@ -1,6 +1,5 @@
 import Metal
 import MetalFX
-import MetalPerformanceShaders
 
 /// The "AI Image Enhancer": cleans and sharpens a frame **without changing
 /// its resolution**. Two engines:
@@ -24,7 +23,7 @@ final class EnhancementProcessor {
 
     private let device: MTLDevice
     private let enhancePipeline: MTLComputePipelineState
-    private let lanczos: MPSImageLanczosScale
+    private let downsamplePipeline: MTLComputePipelineState
 
     private var casOutput: MTLTexture?
     private var neuralUpscaled: MTLTexture?
@@ -35,12 +34,14 @@ final class EnhancementProcessor {
 
     init?(device: MTLDevice, library: MTLLibrary) {
         guard let enhanceFn = library.makeFunction(name: "enhanceKernel"),
-              let pipeline = try? device.makeComputePipelineState(function: enhanceFn) else {
+              let downsampleFn = library.makeFunction(name: "downsampleKernel"),
+              let enhance = try? device.makeComputePipelineState(function: enhanceFn),
+              let downsample = try? device.makeComputePipelineState(function: downsampleFn) else {
             return nil
         }
         self.device = device
-        self.enhancePipeline = pipeline
-        self.lanczos = MPSImageLanczosScale(device: device)
+        self.enhancePipeline = enhance
+        self.downsamplePipeline = downsample
     }
 
     /// Enhances `input` at its own resolution. Not thread-safe — call from
@@ -56,9 +57,10 @@ final class EnhancementProcessor {
             scaler.colorTexture = input
             scaler.outputTexture = upscaled
             scaler.encode(commandBuffer: commandBuffer)
-            lanczos.encode(commandBuffer: commandBuffer,
-                           sourceTexture: upscaled,
-                           destinationTexture: downscaled)
+            guard downsample(from: upscaled, to: downscaled, commandBuffer: commandBuffer) else {
+                return applyCAS(to: input, sharpness: Float(strength),
+                                denoise: Float(strength * 0.7), commandBuffer: commandBuffer)
+            }
             // The supersample already denoised/reconstructed — finish with
             // a lighter sharpen only.
             return applyCAS(to: downscaled,
@@ -117,6 +119,19 @@ final class EnhancementProcessor {
                                         : [.shaderRead, .shaderWrite]
         descriptor.storageMode = .private
         return device.makeTexture(descriptor: descriptor)
+    }
+
+    private func downsample(from src: MTLTexture, to dst: MTLTexture,
+                            commandBuffer: MTLCommandBuffer) -> Bool {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.setComputePipelineState(downsamplePipeline)
+        encoder.setTexture(src, index: 0)
+        encoder.setTexture(dst, index: 1)
+        let group = MTLSize(width: 16, height: 16, depth: 1)
+        let grid = MTLSize(width: (dst.width + 15) / 16, height: (dst.height + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+        encoder.endEncoding()
+        return true
     }
 
     private func applyCAS(to input: MTLTexture, sharpness: Float, denoise: Float,

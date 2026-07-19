@@ -269,6 +269,23 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else { return }
+        // Aspect-fit the video inside the drawable (the pass already cleared
+        // it to black, so unused areas become letterbox/pillarbox bars).
+        // Without this the full-screen triangle stretches the frame to the
+        // window's aspect ratio.
+        let drawableWidth = Double(view.drawableSize.width)
+        let drawableHeight = Double(view.drawableSize.height)
+        let textureWidth = Double(textureToDisplay.width)
+        let textureHeight = Double(textureToDisplay.height)
+        if drawableWidth > 0, drawableHeight > 0, textureWidth > 0, textureHeight > 0 {
+            let scale = min(drawableWidth / textureWidth, drawableHeight / textureHeight)
+            let fitWidth = textureWidth * scale
+            let fitHeight = textureHeight * scale
+            encoder.setViewport(MTLViewport(
+                originX: (drawableWidth - fitWidth) / 2,
+                originY: (drawableHeight - fitHeight) / 2,
+                width: fitWidth, height: fitHeight, znear: 0, zfar: 1))
+        }
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(textureToDisplay, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)

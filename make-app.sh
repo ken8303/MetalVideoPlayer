@@ -12,7 +12,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swift build
+# -gnone disables debug-info (and thus the post-link dsymutil step). Some
+# Macs block dsymutil from writing the .dSYM bundle ("cannot create Plist:
+# Operation not permitted"), which would otherwise fail the build. Debug
+# symbols aren't needed just to run the app.
+swift build -Xswiftc -gnone
 
 BIN=.build/debug/SuperResVideoPlayer
 BUNDLE_SRC=.build/debug/SuperResVideoPlayer_SuperResVideoPlayer.bundle

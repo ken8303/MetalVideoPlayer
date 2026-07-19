@@ -103,6 +103,37 @@ kernel void enhanceKernel(texture2d<float, access::sample> inputTexture [[textur
     outputTexture.write(float4(result, 1.0), gid);
 }
 
+/// Area-averaging downsample from a larger source to a smaller destination.
+/// Used by the Neural/Max image enhancers to bring a 2x/4x reconstructed
+/// image back to the frame's native size. Replaces MPSImageLanczosScale
+/// (whose internal temp-texture allocation could abort). Averages an NxN
+/// grid across each destination pixel's source footprint (N clamped to 4).
+kernel void downsampleKernel(texture2d<float, access::sample> src [[texture(0)]],
+                             texture2d<float, access::write> dst [[texture(1)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint w = dst.get_width();
+    uint h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) {
+        return;
+    }
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    float2 dstSize = float2(w, h);
+    float2 srcSize = float2(src.get_width(), src.get_height());
+    float2 ratio = srcSize / dstSize;                    // e.g. 2.0 or 4.0
+    float2 texel = 1.0 / srcSize;
+    int n = clamp(int(ceil(max(ratio.x, ratio.y))), 1, 4);
+    float2 baseUV = (float2(gid) + 0.5) / dstSize;
+
+    float4 acc = float4(0.0);
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < n; ++i) {
+            float2 frac = (float2(i, j) + 0.5) / float(n) - 0.5;  // -0.5..0.5
+            acc += src.sample(s, baseUV + frac * ratio * texel);
+        }
+    }
+    dst.write(acc / float(n * n), gid);
+}
+
 // MARK: - Frame interpolation support kernels
 
 /// Fills a texture with a flat/constant depth value. Video frames have no

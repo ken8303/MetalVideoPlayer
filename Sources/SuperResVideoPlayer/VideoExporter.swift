@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import Metal
 import MetalFX
 import Vision
@@ -35,7 +36,11 @@ enum VideoExportError: LocalizedError {
 /// encoder applies backpressure). Decode → enhance → append all happen
 /// inside the provider callback, with at most one frame-pair of staged
 /// output at a time.
-final class VideoExporter {
+///
+/// `@unchecked Sendable`: the only cross-thread mutable state (`isCancelled`)
+/// is guarded by `cancelLock`; per-export state lives in `exportSync`'s
+/// stack and is coordinated by locks/serial queues within a single call.
+final class VideoExporter: @unchecked Sendable {
 
     struct Configuration {
         var superResolutionEnabled: Bool
@@ -71,16 +76,62 @@ final class VideoExporter {
         if cancelledNow { throw VideoExportError.cancelled }
     }
 
+    /// Asset metadata loaded via the async API (avoids the deprecated
+    /// synchronous AVAsset accessors) and handed to the background worker.
+    /// `@unchecked Sendable`: AVURLAsset/AVAssetTrack are immutable handles
+    /// here, only read on the worker queue.
+    private struct SourceInfo: @unchecked Sendable {
+        let asset: AVURLAsset
+        let videoTrack: AVAssetTrack
+        let audioTrack: AVAssetTrack?
+        let durationSeconds: Double
+        let sourceFPS: Double
+        let audioChannels: Int
+        let audioSampleRate: Double
+    }
+
     func export(
         source: URL,
         to destination: URL,
         configuration: Configuration,
         onProgress: @escaping @MainActor (Double) -> Void
     ) async throws {
+        // Load everything we need from the asset up front with the async
+        // API, so the synchronous background worker never touches the
+        // deprecated AVAsset accessors.
+        let asset = AVURLAsset(url: source)
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw VideoExportError.unreadableSource("No video track found.")
+        }
+        let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
+        let duration = try await asset.load(.duration).seconds
+        let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+
+        var audioChannels = 2
+        var audioSampleRate = 48000.0
+        if let audioTrack {
+            let formats = try await audioTrack.load(.formatDescriptions)
+            if let fmt = formats.first,
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee {
+                if asbd.mChannelsPerFrame > 0 { audioChannels = min(Int(asbd.mChannelsPerFrame), 2) }
+                if asbd.mSampleRate > 0 { audioSampleRate = asbd.mSampleRate }
+            }
+        }
+
+        let info = SourceInfo(
+            asset: asset,
+            videoTrack: videoTrack,
+            audioTrack: audioTrack,
+            durationSeconds: duration,
+            sourceFPS: Double(nominalFPS > 0 ? nominalFPS : 30),
+            audioChannels: audioChannels,
+            audioSampleRate: audioSampleRate
+        )
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             workQueue.async {
                 do {
-                    try self.exportSync(source: source, destination: destination,
+                    try self.exportSync(info: info, destination: destination,
                                         configuration: configuration, onProgress: onProgress)
                     continuation.resume()
                 } catch {
@@ -94,7 +145,7 @@ final class VideoExporter {
     // MARK: Core (runs on workQueue; frame work runs on providerQueue)
 
     private func exportSync(
-        source: URL,
+        info: SourceInfo,
         destination: URL,
         configuration: Configuration,
         onProgress: @escaping @MainActor (Double) -> Void
@@ -121,15 +172,12 @@ final class VideoExporter {
 
         // MARK: Reader
 
-        let asset = AVURLAsset(url: source)
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            throw VideoExportError.unreadableSource("No video track found.")
-        }
-        let audioTrack = asset.tracks(withMediaType: .audio).first
-        let fullDuration = asset.duration.seconds
+        let asset = info.asset
+        let videoTrack = info.videoTrack
+        let audioTrack = info.audioTrack
         // Progress is measured against the (possibly capped) export length.
-        let duration = min(fullDuration, configuration.durationLimitSeconds ?? fullDuration)
-        let sourceFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30)
+        let duration = min(info.durationSeconds, configuration.durationLimitSeconds ?? info.durationSeconds)
+        let sourceFPS = info.sourceFPS
 
         guard let reader = try? AVAssetReader(asset: asset) else {
             throw VideoExportError.unreadableSource("Couldn't create a decoder for this file.")
@@ -144,13 +192,26 @@ final class VideoExporter {
         }
         reader.add(videoOutput)
 
+        // Decode audio to PCM (rather than compressed passthrough) so the
+        // writer can always re-encode it to AAC — passthrough silently
+        // drops MP4-incompatible codecs. If the source has an audio track
+        // we cannot configure, fail loudly instead of exporting mute.
         var audioOutput: AVAssetReaderTrackOutput?
+        let audioChannels = info.audioChannels
+        let audioSampleRate = info.audioSampleRate
         if let audioTrack {
-            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil) // compressed passthrough
-            if reader.canAdd(output) {
-                reader.add(output)
-                audioOutput = output
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false
+            ])
+            guard reader.canAdd(output) else {
+                throw VideoExportError.unreadableSource("This file's audio track couldn't be decoded for export.")
             }
+            reader.add(output)
+            audioOutput = output
         }
 
         guard reader.startReading() else {
@@ -245,23 +306,30 @@ final class VideoExporter {
         )
 
         var audioInput: AVAssetWriterInput?
-        if let audioTrack, audioOutput != nil {
-            var formatHint: CMFormatDescription?
-            if let first = audioTrack.formatDescriptions.first {
-                formatHint = (first as! CMFormatDescription)
-            }
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: formatHint)
+        if audioOutput != nil {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRate,
+                AVNumberOfChannelsKey: audioChannels,
+                AVEncoderBitRateKey: 192_000
+            ])
             input.expectsMediaDataInRealTime = false
-            if writer.canAdd(input) {
-                writer.add(input)
-                audioInput = input
+            // A present-but-unconfigurable audio track is a hard failure —
+            // never silently export mute.
+            guard writer.canAdd(input) else {
+                throw VideoExportError.writerSetupFailed("Couldn't set up AAC audio for this file.")
             }
+            writer.add(input)
+            audioInput = input
         }
 
         guard writer.startWriting() else {
             throw VideoExportError.writerSetupFailed(writer.error?.localizedDescription ?? "startWriting failed.")
         }
-        writer.startSession(atSourceTime: firstPTS)
+        // Normalize output timestamps to start at zero (sources can have a
+        // non-zero starting PTS after edits/remuxing).
+        let timeOffset = firstPTS
+        writer.startSession(atSourceTime: .zero)
 
         // MARK: Frame helpers (called on providerQueue)
 
@@ -370,9 +438,35 @@ final class VideoExporter {
         var lastProgressPush = 0.0
         let exportStart = Date()
 
+        // Coordinated finish: any failure cancels the reader and unblocks
+        // BOTH waits exactly once, so a failure on one track can't leave the
+        // other provider backpressured (writer stops requesting it) and its
+        // semaphore forever unsignalled.
+        let finishLock = NSLock()
         var providerError: Error?
         var videoFinished = false
+        var videoSignaled = false
+        var audioSignaled = false
         let videoDone = DispatchSemaphore(value: 0)
+        let audioDone = DispatchSemaphore(value: 0)
+
+        func signalVideoOnce() {
+            finishLock.lock(); defer { finishLock.unlock() }
+            if !videoSignaled { videoSignaled = true; videoDone.signal() }
+        }
+        func signalAudioOnce() {
+            finishLock.lock(); defer { finishLock.unlock() }
+            if !audioSignaled { audioSignaled = true; audioDone.signal() }
+        }
+        func fail(_ error: Error) {
+            finishLock.lock()
+            if providerError == nil { providerError = error }
+            videoFinished = true
+            finishLock.unlock()
+            reader.cancelReading()   // makes both providers' copyNextSampleBuffer return nil
+            signalVideoOnce()
+            signalAudioOnce()
+        }
 
         /// Processes one decoded sample into 1..multiplier staged output
         /// buffers (synthesized in-betweens first, then the real frame).
@@ -411,7 +505,8 @@ final class VideoExporter {
                         let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(synthTexture, commandBuffer: commandBuffer),
                                                            commandBuffer: commandBuffer)
                         let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
-                        staged.append((outBuffer, prev.pts + CMTimeMultiplyByFloat64(span, multiplier: t)))
+                        let synthPTS = CMTimeSubtract(prev.pts + CMTimeMultiplyByFloat64(span, multiplier: t), timeOffset)
+                        staged.append((outBuffer, synthPTS))
                         synthFrames += 1
                     }
                     _ = flow.backing
@@ -422,7 +517,7 @@ final class VideoExporter {
             let finalTexture = upscaleIfNeeded(try enhanceIfNeeded(texture, commandBuffer: commandBuffer),
                                                commandBuffer: commandBuffer)
             let outBuffer = try renderToOutputBuffer(finalTexture, commandBuffer: commandBuffer)
-            staged.append((outBuffer, pts))
+            staged.append((outBuffer, CMTimeSubtract(pts, timeOffset)))
 
             previous = (pixelBuffer, texture, pts)
             realFrames += 1
@@ -431,14 +526,15 @@ final class VideoExporter {
             // pixel-buffer pool and decoding stalls after a few dozen frames.
             CVMetalTextureCacheFlush(textureCache, 0)
 
+            let elapsedVideo = CMTimeSubtract(pts, timeOffset).seconds
             if realFrames % 120 == 0 {
                 let elapsed = Date().timeIntervalSince(exportStart)
                 let rate = Double(realFrames + synthFrames) / max(elapsed, 0.001)
                 print(String(format: "SuperResVideoPlayer: export — %d real + %d synth frames, %.1f fps, video time %.1fs / %.1fs",
-                             realFrames, synthFrames, rate, pts.seconds, duration))
+                             realFrames, synthFrames, rate, elapsedVideo, duration))
             }
             if duration > 0 {
-                let progress = min(1.0, max(0.0, pts.seconds / duration))
+                let progress = min(1.0, max(0.0, elapsedVideo / duration))
                 if progress - lastProgressPush >= 0.0005 {
                     lastProgressPush = progress
                     Task { @MainActor in onProgress(progress) }
@@ -449,7 +545,8 @@ final class VideoExporter {
         // MARK: Writer-driven video loop
 
         videoInput.requestMediaDataWhenReady(on: providerQueue) {
-            guard !videoFinished else { return }
+            finishLock.lock(); let done = videoFinished; finishLock.unlock()
+            guard !done else { return }
             do {
                 while videoInput.isReadyForMoreMediaData {
                     if self.cancelledNow { throw VideoExportError.cancelled }
@@ -469,89 +566,82 @@ final class VideoExporter {
                     } else {
                         sample = videoOutput.copyNextSampleBuffer()
                     }
-                    // Test export: stop once we've passed the time cap.
+                    // Test export: stop once past the cap (timestamps
+                    // normalized against the first video PTS).
                     if let sample, let limit = configuration.durationLimitSeconds,
-                       CMSampleBufferGetPresentationTimeStamp(sample).seconds > limit {
-                        videoFinished = true
+                       CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), timeOffset).seconds > limit {
+                        finishLock.lock(); videoFinished = true; finishLock.unlock()
                         videoInput.markAsFinished()
-                        videoDone.signal()
+                        signalVideoOnce()
                         return
                     }
                     guard let sample else {
-                        videoFinished = true
+                        finishLock.lock(); videoFinished = true; finishLock.unlock()
                         videoInput.markAsFinished()
-                        videoDone.signal()
+                        signalVideoOnce()
                         return
                     }
                     try stageOutputs(for: sample)
                 }
             } catch {
-                providerError = error
-                videoFinished = true
                 videoInput.markAsFinished()
-                videoDone.signal()
+                fail(error)
             }
         }
 
-        // MARK: Audio passthrough — MUST run concurrently with video.
+        // MARK: Audio (AAC) — MUST run concurrently with video.
         // AVAssetWriter interleaves its tracks: it stops requesting video
         // once video runs ~2s ahead of audio, so feeding audio "afterwards"
         // deadlocks the video provider almost immediately.
 
-        var audioError: Error?
-        let audioDone = DispatchSemaphore(value: 0)
         if let audioOutput, let audioInput {
             audioInput.requestMediaDataWhenReady(on: audioQueue) {
                 while audioInput.isReadyForMoreMediaData {
                     if self.cancelledNow {
-                        audioError = VideoExportError.cancelled
                         audioInput.markAsFinished()
-                        audioDone.signal()
+                        fail(VideoExportError.cancelled)
                         return
                     }
                     let sample = audioOutput.copyNextSampleBuffer()
-                    // Match the video time cap for test exports.
                     if let sample, let limit = configuration.durationLimitSeconds,
-                       CMSampleBufferGetPresentationTimeStamp(sample).seconds > limit {
+                       CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), timeOffset).seconds > limit {
                         audioInput.markAsFinished()
-                        audioDone.signal()
+                        signalAudioOnce()
                         return
                     }
                     guard let sample else {
                         audioInput.markAsFinished()
-                        audioDone.signal()
+                        signalAudioOnce()
                         return
                     }
-                    if !audioInput.append(sample) {
-                        audioError = VideoExportError.processingFailed(
-                            writer.error?.localizedDescription ?? "Audio append failed.")
+                    // Shift audio to the same zero-based timeline as video.
+                    let adjusted = Self.offsetSampleTimestamps(sample, by: timeOffset) ?? sample
+                    if !audioInput.append(adjusted) {
                         audioInput.markAsFinished()
-                        audioDone.signal()
+                        fail(VideoExportError.processingFailed(
+                            writer.error?.localizedDescription ?? "Audio append failed."))
                         return
                     }
                 }
             }
         } else {
-            audioDone.signal()
+            signalAudioOnce()
         }
 
-        // Wait for both providers, staying responsive to cancellation
-        // (cancelReading makes both copyNextSampleBuffer return nil, which
-        // drains the providers cleanly).
+        // Wait for both providers. `fail()` unblocks both exactly once, and
+        // a writer failure also breaks the loops.
         while videoDone.wait(timeout: .now() + 0.25) == .timedOut {
             if cancelledNow { reader.cancelReading() }
+            if writer.status == .failed { fail(writer.error ?? VideoExportError.processingFailed("Writer failed.")) }
         }
         while audioDone.wait(timeout: .now() + 0.25) == .timedOut {
             if cancelledNow { reader.cancelReading() }
+            if writer.status == .failed { fail(writer.error ?? VideoExportError.processingFailed("Writer failed.")) }
         }
 
         if let providerError {
             writer.cancelWriting()
             throw providerError
-        }
-        if let audioError {
-            writer.cancelWriting()
-            throw audioError
         }
         if reader.status == .failed {
             writer.cancelWriting()
@@ -567,5 +657,36 @@ final class VideoExporter {
             throw VideoExportError.processingFailed(writer.error?.localizedDescription ?? "Finalizing failed.")
         }
         Task { @MainActor in onProgress(1.0) }
+    }
+
+    /// Returns a copy of `sample` with its presentation (and decode)
+    /// timestamps shifted earlier by `offset`, so audio lands on the same
+    /// zero-based timeline as the normalized video.
+    private static func offsetSampleTimestamps(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
+        var count: CMItemCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0, arrayToFill: nil, entriesNeededOut: &count) == noErr else {
+            return nil
+        }
+        var timings = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        guard CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count, arrayToFill: &timings, entriesNeededOut: &count) == noErr else {
+            return nil
+        }
+        for i in 0..<timings.count {
+            if timings[i].presentationTimeStamp.isValid {
+                timings[i].presentationTimeStamp = CMTimeSubtract(timings[i].presentationTimeStamp, offset)
+            }
+            if timings[i].decodeTimeStamp.isValid {
+                timings[i].decodeTimeStamp = CMTimeSubtract(timings[i].decodeTimeStamp, offset)
+            }
+        }
+        var adjusted: CMSampleBuffer?
+        guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                    sampleBuffer: sample,
+                                                    sampleTimingEntryCount: count,
+                                                    sampleTimingArray: &timings,
+                                                    sampleBufferOut: &adjusted) == noErr else {
+            return nil
+        }
+        return adjusted
     }
 }

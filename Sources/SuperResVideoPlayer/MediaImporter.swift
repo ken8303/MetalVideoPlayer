@@ -28,7 +28,11 @@ enum MediaImportError: LocalizedError {
 /// the audio track into a small temporary .m4a (stream-copy when it's
 /// already AAC/ALAC, transcode otherwise) is fast and leaves the video
 /// untouched. Results are cached keyed on the source's path/size/mtime.
-final class MediaImporter {
+///
+/// `@unchecked Sendable`: all mutable state (`runningProcess`) is guarded by
+/// `processLock`, and work is dispatched onto a serial queue — the safety
+/// the compiler can't verify is enforced manually here.
+final class MediaImporter: @unchecked Sendable {
 
     /// Whether Speech/AVFoundation can read this file directly, or its
     /// audio needs extracting first. Decided by sniffing the actual file
@@ -82,6 +86,53 @@ final class MediaImporter {
                 }
             }
         }
+    }
+
+    /// Transcodes to a baseline H.264 8-bit 4:2:0 .mp4 that AVAssetReader
+    /// can always decode. Used as an export fallback when the reader can't
+    /// handle the source directly (e.g. 10-bit HEVC). The player's Metal
+    /// pipeline is 8-bit anyway, so no additional precision is lost.
+    func transcodeForExport(from url: URL, onProgress: @escaping (Double) -> Void) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            workQueue.async {
+                do {
+                    continuation.resume(returning: try self.transcodeForExportSync(url: url, onProgress: onProgress))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func transcodeForExportSync(url: URL, onProgress: @escaping (Double) -> Void) throws -> URL {
+        guard let ffmpeg = Self.findExecutable("ffmpeg") else {
+            throw MediaImportError.ffmpegNotFound
+        }
+        let outputURL = try cachedOutputURL(for: url, kind: "compat", ext: "mp4")
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            return outputURL
+        }
+        let info = probe(url: url)
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.mp4")
+        try? FileManager.default.removeItem(at: partialURL)
+
+        let args = [
+            "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
+            "-i", url.path,
+            "-map", "0:v:0", "-map", "0:a:0?", "-sn",
+            "-c:v", "h264_videotoolbox", "-pix_fmt", "yuv420p", "-b:v", "20M",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", partialURL.path
+        ]
+        do {
+            try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
+                          durationSeconds: info.duration, onProgress: onProgress)
+        } catch {
+            try? FileManager.default.removeItem(at: partialURL)
+            throw error
+        }
+        try FileManager.default.moveItem(at: partialURL, to: outputURL)
+        return outputURL
     }
 
     /// Repackages an AVFoundation-unreadable container (MKV, WebM, ...)

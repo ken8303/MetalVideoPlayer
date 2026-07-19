@@ -464,6 +464,23 @@ final class PlayerViewModel: ObservableObject {
                 self.videoExporter = nil
                 self.exportImporter = nil
             }
+            func runExport(from readableSource: URL, using activeExporter: VideoExporter) async throws {
+                self.statusMessage = "Exporting video… 0.00% (interpolation makes this slower than real time)"
+                let exportStart = Date()
+                try await activeExporter.export(source: readableSource, to: destination,
+                                                configuration: configuration) { [weak self] progress in
+                    guard let self, self.isExportingVideo else { return }
+                    self.exportProgress = progress
+                    var text = String(format: "Exporting video… %.2f%%", progress * 100)
+                    if progress > 0.001 {
+                        let elapsed = Date().timeIntervalSince(exportStart)
+                        let remaining = elapsed / progress - elapsed
+                        text += String(format: " — about %.0f min left", max(remaining / 60, 1))
+                    }
+                    self.statusMessage = text
+                }
+            }
+
             do {
                 var readableSource = source
                 // AVAssetReader can't open MKV/WebM/... — repackage first
@@ -476,19 +493,23 @@ final class PlayerViewModel: ObservableObject {
                     }
                 }
 
-                self.statusMessage = "Exporting video… 0.00% (interpolation makes this slower than real time)"
-                let exportStart = Date()
-                try await exporter.export(source: readableSource, to: destination,
-                                          configuration: configuration) { [weak self] progress in
-                    guard let self, self.isExportingVideo else { return }
-                    self.exportProgress = progress
-                    var text = String(format: "Exporting video… %.2f%%", progress * 100)
-                    if progress > 0.001 {
-                        let elapsed = Date().timeIntervalSince(exportStart)
-                        let remaining = elapsed / progress - elapsed
-                        text += String(format: " — about %.0f min left", max(remaining / 60, 1))
+                do {
+                    try await runExport(from: readableSource, using: exporter)
+                } catch let error as VideoExportError {
+                    // AVAssetReader can't decode some streams (e.g. 10-bit
+                    // HEVC) even from an .mp4. Our pipeline is 8-bit anyway,
+                    // so transcode to a baseline H.264 8-bit intermediate
+                    // and retry once.
+                    guard case .unreadableSource = error, MediaImporter.isFFmpegAvailable else { throw error }
+                    print("SuperResVideoPlayer: export reader failed (\(error.localizedDescription)); transcoding to a compatible format and retrying")
+                    self.statusMessage = "Preparing source for export…"
+                    let compatible = try await importer.transcodeForExport(from: readableSource) { [weak self] progress in
+                        guard let self, self.isExportingVideo else { return }
+                        self.statusMessage = "Preparing source for export… \(Int(progress * 100))%"
                     }
-                    self.statusMessage = text
+                    let retryExporter = VideoExporter()
+                    self.videoExporter = retryExporter
+                    try await runExport(from: compatible, using: retryExporter)
                 }
                 NSWorkspace.shared.activateFileViewerSelecting([destination])
             } catch {
