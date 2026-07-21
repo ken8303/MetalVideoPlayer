@@ -438,6 +438,10 @@ final class MediaImporter: @unchecked Sendable {
             .appendingPathComponent("SuperResVideoPlayer-Media", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
+        // Keep the cache from growing without bound (remuxed .mp4s can be
+        // large). Evict oldest files first, before writing a new one.
+        Self.pruneCache(directory: directory, maxTotalBytes: 3_000_000_000)
+
         // Key on path + size + mtime so an edited/replaced source file
         // doesn't serve a stale cached extraction.
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -450,5 +454,34 @@ final class MediaImporter: @unchecked Sendable {
             .prefix(16)
 
         return directory.appendingPathComponent("\(digest)-\(kind).\(ext)")
+    }
+
+    /// Evicts the oldest cache files (by modification date) until the total
+    /// size is within `maxTotalBytes`. Skips in-progress `.part.*` files so
+    /// an active extraction isn't deleted out from under itself.
+    private static func pruneCache(directory: URL, maxTotalBytes: Int) {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+        guard let items = try? fm.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: keys) else { return }
+
+        var files = items.compactMap { url -> (url: URL, size: Int, date: Date)? in
+            guard !url.lastPathComponent.contains(".part."),
+                  let v = try? url.resourceValues(forKeys: Set(keys)),
+                  v.isRegularFile == true,
+                  let size = v.fileSize, let date = v.contentModificationDate else { return nil }
+            return (url, size, date)
+        }
+
+        var total = files.reduce(0) { $0 + $1.size }
+        guard total > maxTotalBytes else { return }
+
+        files.sort { $0.date < $1.date }   // oldest first
+        for file in files {
+            if total <= maxTotalBytes { break }
+            if (try? fm.removeItem(at: file.url)) != nil {
+                total -= file.size
+            }
+        }
     }
 }
