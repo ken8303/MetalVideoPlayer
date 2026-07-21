@@ -87,7 +87,12 @@ final class EnhancementProcessor {
         }
 
         if wantNeural, neuralSupported, neuralScaler == nil {
-            guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+            // The neural path reconstructs at 2x internally; that intermediate
+            // texture must stay within the GPU's 16384-per-side limit. For
+            // frames wider/taller than 8192 (e.g. 8K VR), fall back to the
+            // Classic engine rather than failing.
+            guard width * 2 <= 16384, height * 2 <= 16384,
+                  MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
                 neuralSupported = false
                 return
             }

@@ -353,7 +353,11 @@ final class PlayerViewModel: ObservableObject {
 
             do {
                 let cues: [SubtitleCue]
-                if MediaImporter.needsAudioExtraction(url) {
+                // The speech engines read via AVAudioFile, which can't open
+                // video containers (mp4/mov included) — only pure audio
+                // files. So extract audio first for anything that isn't
+                // already an audio file.
+                if !MediaImporter.isPureAudioFile(url) {
                     self.statusMessage = "Extracting audio track…"
                     let audioURL = try await extractAudio()
                     guard self.subtitleGenerationID == myGeneration else { return }

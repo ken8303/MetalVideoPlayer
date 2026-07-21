@@ -244,7 +244,20 @@ final class SubtitleGenerator {
             throw SubtitleGenerationError.authorizationDenied
         }
 
-        let request = SFSpeechURLRecognitionRequest(url: url)
+        // Read the audio ourselves and stream PCM buffers into Speech via
+        // SFSpeechAudioBufferRecognitionRequest, instead of the file-based
+        // SFSpeechURLRecognitionRequest. The URL request builds an internal
+        // AVAssetReaderAudioMixOutput that throws an *uncatchable* ObjC
+        // exception on macOS 27 beta for some inputs (crashing the app). The
+        // buffer request never touches that code path.
+        let audioFile: AVAudioFile
+        do {
+            audioFile = try AVAudioFile(forReading: url)
+        } catch {
+            throw SubtitleGenerationError.recognitionFailed(error)
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
@@ -285,6 +298,23 @@ final class SubtitleGenerator {
                     }
                     self.resumePending(returning: Self.buildCues(from: words, joiningWith: separator))
                 }
+            }
+
+            // Stream the whole file into the recognizer in PCM chunks.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let format = audioFile.processingFormat
+                let chunkFrames: AVAudioFrameCount = 16384
+                do {
+                    while true {
+                        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames) else { break }
+                        try audioFile.read(into: buffer)
+                        if buffer.frameLength == 0 { break }  // EOF
+                        request.append(buffer)
+                    }
+                } catch {
+                    print("SuperResVideoPlayer: legacy audio read failed: \(error)")
+                }
+                request.endAudio()
             }
         }
     }

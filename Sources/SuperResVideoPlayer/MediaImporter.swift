@@ -4,6 +4,7 @@ import CryptoKit
 enum MediaImportError: LocalizedError {
     case ffmpegNotFound
     case extractionFailed(exitCode: Int32, log: String)
+    case noAudioTrack
     case cancelled
 
     var errorDescription: String? {
@@ -13,6 +14,8 @@ enum MediaImportError: LocalizedError {
         case .extractionFailed(let code, let log):
             let tail = log.split(separator: "\n").suffix(2).joined(separator: " ")
             return "Audio extraction failed (ffmpeg exited \(code)). \(tail)"
+        case .noAudioTrack:
+            return "This video has no audio track, so there's nothing to transcribe into subtitles."
         case .cancelled:
             return "Audio extraction was cancelled."
         }
@@ -34,10 +37,20 @@ enum MediaImportError: LocalizedError {
 /// the compiler can't verify is enforced manually here.
 final class MediaImporter: @unchecked Sendable {
 
-    /// Whether Speech/AVFoundation can read this file directly, or its
-    /// audio needs extracting first. Decided by sniffing the actual file
-    /// content, not the extension — files are often mislabeled (e.g. an
-    /// .mkv renamed to .mp4 plays fine in mpv but is still Matroska inside).
+    /// Pure audio files that `AVAudioFile` (used by both speech engines) can
+    /// open directly. Everything else — including video containers like
+    /// .mp4/.mov that AVAudioFile CANNOT demux — needs its audio extracted
+    /// first for transcription.
+    static func isPureAudioFile(_ url: URL) -> Bool {
+        ["m4a", "mp3", "wav", "aac", "caf", "aiff", "aif", "aifc", "flac", "au", "m4b"]
+            .contains(url.pathExtension.lowercased())
+    }
+
+    /// Whether the video exporter's AVAssetReader needs this repackaged
+    /// first. Decided by sniffing the actual file content, not the
+    /// extension — files are often mislabeled (e.g. an .mkv renamed to .mp4
+    /// plays fine in mpv but is still Matroska inside). AVAssetReader reads
+    /// mp4/mov natively, so those return false here (unlike the audio path).
     static func needsAudioExtraction(_ url: URL) -> Bool {
         if let handle = try? FileHandle(forReadingFrom: url),
            let header = try? handle.read(upToCount: 12) {
@@ -216,37 +229,50 @@ final class MediaImporter: @unchecked Sendable {
             throw MediaImportError.ffmpegNotFound
         }
 
-        let outputURL = try cachedOutputURL(for: url, kind: "audio", ext: "m4a")
+        let outputURL = try cachedOutputURL(for: url, kind: "audio", ext: "wav")
         if FileManager.default.fileExists(atPath: outputURL.path) {
             return outputURL
         }
 
         let info = probe(url: url)
 
-        // AAC/ALAC can be stream-copied into .m4a losslessly; everything
-        // else (FLAC, Opus, AC-3, ...) is transcoded to AAC — still fast,
-        // since it's audio only.
-        let copyable: Set<String> = ["aac", "alac"]
-        let audioCopy = info.audioCodec.map { copyable.contains($0) } ?? false
+        // Probe found video but no audio (both nil only when ffprobe itself
+        // is unavailable, in which case we let ffmpeg try and report). A
+        // video-only file has nothing to transcribe.
+        if info.videoCodec != nil, info.audioCodec == nil {
+            throw MediaImportError.noAudioTrack
+        }
 
         // Write to a partial file and rename on success, so a cancelled or
         // failed extraction never leaves a truncated file in the cache.
-        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.m4a")
+        let partialURL = outputURL.deletingPathExtension().appendingPathExtension("part.wav")
         try? FileManager.default.removeItem(at: partialURL)
 
-        var args = [
+        // Extract to 16 kHz mono 16-bit PCM WAV — the canonical input for
+        // Apple's speech engines, read natively by AVAudioFile, and free of
+        // any container/movflags quirks (an m4a + `-movflags +faststart`
+        // output was rejected by some ffmpeg builds with EINVAL).
+        let args = [
             "-y", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1",
             "-i", url.path,
-            "-vn", "-sn", "-map", "0:a:0"
+            "-vn", "-sn", "-map", "0:a:0",
+            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+            partialURL.path
         ]
-        args += audioCopy ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "160k"]
-        args += ["-movflags", "+faststart", partialURL.path]
 
         do {
             try runFFmpeg(arguments: args, ffmpegPath: ffmpeg,
                           durationSeconds: info.duration, onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: partialURL)
+            // When ffprobe wasn't available to pre-detect it, a video-only
+            // file surfaces here as ffmpeg's "matches no streams" — map it
+            // to the clear no-audio message.
+            if case let MediaImportError.extractionFailed(_, log) = error,
+               log.localizedCaseInsensitiveContains("matches no streams")
+                || log.localizedCaseInsensitiveContains("does not contain any stream") {
+                throw MediaImportError.noAudioTrack
+            }
             throw error
         }
 

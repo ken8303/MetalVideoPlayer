@@ -488,11 +488,24 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     // MARK: MetalFX Super Resolution (unchanged from the initial version)
 
+    /// Apple-family GPUs cap 2D textures at 16384 per side. Upscaling large
+    /// (e.g. 8K) frames can exceed this, which would make MetalFX fail and
+    /// silently disable SR entirely — so the effective factor is clamped to
+    /// keep the output within the limit (some upscaling beats none).
+    private static let maxTextureDimension = 16384
+
     private func upscale(_ input: MTLTexture, factor: Double, commandBuffer: MTLCommandBuffer) -> MTLTexture? {
         let inputWidth = input.width
         let inputHeight = input.height
-        let outputWidth = max(inputWidth, Int(Double(inputWidth) * factor))
-        let outputHeight = max(inputHeight, Int(Double(inputHeight) * factor))
+
+        let limitFactor = min(Double(Self.maxTextureDimension) / Double(inputWidth),
+                              Double(Self.maxTextureDimension) / Double(inputHeight))
+        let effectiveFactor = min(factor, limitFactor)
+        // Already at/over the limit — nothing to upscale into; show native.
+        guard effectiveFactor > 1.01 else { return nil }
+
+        let outputWidth = max(inputWidth, Int(Double(inputWidth) * effectiveFactor))
+        let outputHeight = max(inputHeight, Int(Double(inputHeight) * effectiveFactor))
 
         let sizeChanged = lastScalerInputSize.width != inputWidth || lastScalerInputSize.height != inputHeight
         let factorChanged = lastUpscaleFactor != factor

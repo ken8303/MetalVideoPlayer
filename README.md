@@ -44,9 +44,11 @@ real time:
 ## Requirements
 
 - Apple Silicon Mac (MetalFX requires an Apple-family GPU).
-- **macOS 26 "Tahoe" or later** — hard floor for `MTLFXFrameInterpolator`
-  (Metal 4) and the SpeechAnalyzer API.
-- Xcode 26+ / a Swift 6.2+ toolchain to build.
+- **macOS 27 "Golden Gate" or later** (deployment target; built against the
+  macOS 27 SDK). Underlying APIs — `MTLFXFrameInterpolator` (Metal 4),
+  SpeechAnalyzer, Foundation Models — first shipped in macOS 26; macOS 27
+  adds the improved on-device translation model.
+- Xcode 27+ / a Swift 6.2+ toolchain to build.
 - **libmpv**: `brew install mpv`
 - Optional: `brew install ffmpeg` — used only to extract audio for subtitle
   generation from containers Apple's Speech framework can't read (MKV,

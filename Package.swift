@@ -1,5 +1,6 @@
-// swift-tools-version:6.2
-// (6.2+ is required for PackageDescription to expose `.macOS(.v26)` below.)
+// swift-tools-version:6.4
+// (6.4+ is required for PackageDescription to expose `.macOS(.v27)` below;
+// ships with the Xcode 27 toolchain.)
 import PackageDescription
 import Foundation
 
@@ -15,15 +16,11 @@ let infoPlistPath = URL(fileURLWithPath: #filePath)
 let package = Package(
     name: "SuperResVideoPlayer",
     platforms: [
-        // MetalFX Frame Interpolation (MTLFXFrameInterpolator, part of
-        // Metal 4) requires macOS 26+. The Super Resolution spatial scaler
-        // alone only needs macOS 13/14, but since this target now also uses
-        // frame interpolation, the whole app needs macOS 26 as its floor.
-        // If `.v26` isn't recognized, your installed Swift toolchain
-        // predates macOS 26 SDK support — install Xcode 26+ or a matching
-        // toolchain, or bump swift-tools-version above if Apple ships a
-        // newer PackageDescription API for it.
-        .macOS(.v26)
+        // Targets macOS 27, built against the macOS 27 SDK. Requires the
+        // Xcode 27 toolchain to be the *active* one — if `.v27` fails to
+        // resolve, run `sudo xcode-select -s /Applications/Xcode-beta.app`
+        // (the build is still picking up the 26.x SDK otherwise).
+        .macOS(.v27)
     ],
     targets: [
         // libmpv (the engine inside mpv/IINA) handles demuxing and decoding

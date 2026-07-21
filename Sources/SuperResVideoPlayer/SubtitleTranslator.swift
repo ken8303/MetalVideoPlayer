@@ -62,7 +62,12 @@ enum SubtitleTranslator {
             .localizedString(forIdentifier: sourceLocale.identifier) ?? sourceLocale.identifier
         let targetName = languageName(for: targetIdentifier)
 
-        let batchSize = 15
+        // The macOS 27 on-device model has a larger context window, so we
+        // translate more lines per request — fewer round-trips, faster full
+        // videos, and more consistent phrasing within a scene. A failed or
+        // garbled batch still falls back to per-line retry below, so a
+        // larger batch never risks losing more than it re-processes.
+        let batchSize = 40
         var completed = 0
         var untranslated = 0
 
