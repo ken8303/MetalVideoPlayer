@@ -34,9 +34,23 @@ let package = Package(
             pkgConfig: "mpv",
             providers: [.brew(["mpv"])]
         ),
+        // Dependency-free library holding the pure logic (subtitle grouping,
+        // .srt formatting, translation parsing, media classification) so it
+        // can be unit-tested without AVFoundation/Speech/Metal.
+        .target(
+            name: "SuperResCore",
+            path: "Sources/SuperResCore",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "SuperResCoreTests",
+            dependencies: ["SuperResCore"],
+            path: "Tests/SuperResCoreTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .executableTarget(
             name: "SuperResVideoPlayer",
-            dependencies: ["Cmpv"],
+            dependencies: ["Cmpv", "SuperResCore"],
             path: "Sources/SuperResVideoPlayer",
             resources: [
                 // Ship the raw shader source in the module's resource

@@ -4,6 +4,7 @@ import Metal
 import MetalFX
 import Vision
 import CoreVideo
+import SuperResCore
 
 enum VideoExportError: LocalizedError {
     case cancelled
@@ -278,7 +279,7 @@ final class VideoExporter: @unchecked Sendable {
         try? FileManager.default.removeItem(at: destination)
         let writer = try AVAssetWriter(outputURL: destination, fileType: .mp4)
         let outputFPS = sourceFPS * Double(multiplier)
-        let bitrate = min(80_000_000, max(2_000_000, Int(Double(outWidth * outHeight) * outputFPS * 0.07)))
+        let bitrate = VideoMath.recommendedBitrate(width: outWidth, height: outHeight, fps: outputFPS)
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: outWidth,

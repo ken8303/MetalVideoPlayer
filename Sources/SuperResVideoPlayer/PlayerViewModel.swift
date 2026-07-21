@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import UniformTypeIdentifiers
 import Speech
+import SuperResCore
 
 /// Which implementation the AI Image Enhancer uses.
 enum EnhancerEngine: String, CaseIterable, Identifiable {

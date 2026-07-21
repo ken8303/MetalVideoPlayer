@@ -1,6 +1,7 @@
 import Speech
 import AVFoundation
 import Foundation
+import SuperResCore
 
 enum SubtitleGenerationError: LocalizedError {
     case authorizationDenied
@@ -32,14 +33,6 @@ enum SubtitleGenerationError: LocalizedError {
 ///     the last utterance (the classic "my subtitles are one line" bug),
 ///     so it's only used when there's no alternative.
 final class SubtitleGenerator {
-
-    /// One transcribed word with its position in the audio timeline —
-    /// the common currency both engines are reduced to.
-    struct WordTiming {
-        let text: String
-        let start: TimeInterval
-        let end: TimeInterval
-    }
 
     /// Requests Speech Recognition authorization if not already granted
     /// (only the legacy engine needs this; SpeechAnalyzer transcribes
@@ -225,7 +218,9 @@ final class SubtitleGenerator {
         }
         try await analysisTask.value
 
-        return Self.buildCues(from: words, joiningWith: Self.wordSeparator(for: locale))
+        return SubtitleGrouping.buildCues(
+            from: words,
+            joiningWith: SubtitleGrouping.wordSeparator(forLanguageCode: locale.identifier))
     }
 
     // MARK: Legacy engine (SFSpeechRecognizer)
@@ -263,7 +258,7 @@ final class SubtitleGenerator {
             request.requiresOnDeviceRecognition = true
         }
 
-        let separator = Self.wordSeparator(for: locale)
+        let separator = SubtitleGrouping.wordSeparator(forLanguageCode: locale.identifier)
 
         return try await withCheckedThrowingContinuation { continuation in
             continuationLock.lock()
@@ -296,7 +291,7 @@ final class SubtitleGenerator {
                     let words = result.bestTranscription.segments.map {
                         WordTiming(text: $0.substring, start: $0.timestamp, end: $0.timestamp + $0.duration)
                     }
-                    self.resumePending(returning: Self.buildCues(from: words, joiningWith: separator))
+                    self.resumePending(returning: SubtitleGrouping.buildCues(from: words, joiningWith: separator))
                 }
             }
 
@@ -337,54 +332,4 @@ final class SubtitleGenerator {
         continuation?.resume(throwing: error)
     }
 
-    // MARK: Cue building
-
-    /// CJK-family languages aren't space-delimited — joining their "words"
-    /// with spaces produces unnatural subtitles.
-    private static func wordSeparator(for locale: Locale) -> String {
-        let language = locale.identifier.prefix(2).lowercased()
-        return ["zh", "ja", "ko", "th"].contains(language) ? "" : " "
-    }
-
-    /// Groups word-level timings into readable subtitle cues. A new cue
-    /// starts after a pause longer than `pauseThreshold`, once the cue
-    /// would exceed the character budget (~two subtitle lines; halved for
-    /// CJK since those glyphs are double-width), or once it would span more
-    /// than `maxCueDuration` seconds. A simple heuristic, not a sentence
-    /// segmenter — cue breaks won't always land on natural boundaries.
-    private static func buildCues(from words: [WordTiming], joiningWith separator: String) -> [SubtitleCue] {
-        guard !words.isEmpty else { return [] }
-
-        let maxCueDuration: TimeInterval = 6.0
-        let maxCueChars = separator.isEmpty ? 32 : 84
-        let pauseThreshold: TimeInterval = 0.35
-        let trailingPadding: TimeInterval = 0.15
-
-        var cues: [SubtitleCue] = []
-        var currentWords: [WordTiming] = []
-
-        func flush() {
-            guard let first = currentWords.first, let last = currentWords.last else { return }
-            let text = currentWords.map(\.text).joined(separator: separator)
-            cues.append(SubtitleCue(startTime: first.start, endTime: last.end + trailingPadding, text: text))
-            currentWords.removeAll()
-        }
-
-        for word in words {
-            if let last = currentWords.last, let first = currentWords.first {
-                let gap = word.start - last.end
-                let projectedChars = (currentWords.map(\.text) + [word.text])
-                    .joined(separator: separator).count
-                let projectedDuration = word.end - first.start
-
-                if gap > pauseThreshold || projectedChars > maxCueChars || projectedDuration > maxCueDuration {
-                    flush()
-                }
-            }
-            currentWords.append(word)
-        }
-        flush()
-
-        return cues
-    }
 }
