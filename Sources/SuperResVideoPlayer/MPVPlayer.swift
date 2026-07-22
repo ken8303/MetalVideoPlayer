@@ -289,6 +289,19 @@ final class MPVPlayer {
         command(["seek", String(seconds), "absolute+exact"])
     }
 
+    /// mpv's software volume, 0...100 (values above 100 amplify; we don't).
+    func setVolume(_ percent: Double) {
+        guard let handle else { return }
+        var value = min(100, max(0, percent))
+        mpv_set_property(handle, "volume", MPV_FORMAT_DOUBLE, &value)
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard let handle else { return }
+        var flag: Int32 = muted ? 1 : 0
+        mpv_set_property(handle, "mute", MPV_FORMAT_FLAG, &flag)
+    }
+
     /// Current playback position in seconds. Thread-safe; used by the
     /// renderer every draw to compute the interpolation phase.
     var playbackTime: Double {

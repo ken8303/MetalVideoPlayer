@@ -7,6 +7,7 @@ enum SubtitleGenerationError: LocalizedError {
     case authorizationDenied
     case recognizerUnavailable
     case recognitionFailed(Error)
+    case legacyDurationLimit
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ enum SubtitleGenerationError: LocalizedError {
             return "Speech recognition isn't available for the selected language on this Mac."
         case .recognitionFailed(let error):
             return "Transcription failed: \(error.localizedDescription)"
+        case .legacyDurationLimit:
+            return "This language uses the older speech engine on this Mac, which can only transcribe clips under a minute. Pick a language supported by the on-device model, or use a shorter clip."
         }
     }
 }
@@ -233,6 +236,14 @@ final class SubtitleGenerator {
     ) async throws -> [SubtitleCue] {
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             throw SubtitleGenerationError.recognizerUnavailable
+        }
+
+        // SFSpeechRecognizer caps on-device recognition at ~1 minute of
+        // audio; beyond that it silently truncates. Fail clearly instead of
+        // returning subtitles that only cover the first minute. (60s minus a
+        // safety margin; totalDuration == 0 means unknown, so allow it.)
+        if totalDuration > 58 {
+            throw SubtitleGenerationError.legacyDurationLimit
         }
 
         guard await Self.requestAuthorizationIfNeeded() else {

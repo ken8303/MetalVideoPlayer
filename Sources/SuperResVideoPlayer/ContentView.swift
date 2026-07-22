@@ -1,36 +1,49 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var playerViewModel = PlayerViewModel()
+    /// Owned by the App scene so the menu-bar commands can drive playback
+    /// with keyboard shortcuts.
+    @ObservedObject var playerViewModel: PlayerViewModel
+
+    /// Highlights the video area while a file is dragged over it.
+    @State private var isDropTargeted = false
+
+    // Auto-hiding controls (full screen only).
+    @State private var isFullScreen = false
+    @State private var controlsVisible = true
+    @State private var hideControlsTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .bottom) {
-                MetalVideoView(playerViewModel: playerViewModel)
-                    .background(Color.black)
-
-                if let text = playerViewModel.subtitleText(at: playerViewModel.currentTime) {
-                    Text(text)
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
-                        .padding(.bottom, 24)
-                        .padding(.horizontal, 40)
-                        .shadow(radius: 2)
-                        .allowsHitTesting(false)
+        Group {
+            if isFullScreen {
+                // Overlay the controls so hiding them yields full-frame video.
+                ZStack(alignment: .bottom) {
+                    videoArea
+                    controlsBar
+                        .opacity(controlsVisible ? 1 : 0)
+                        .allowsHitTesting(controlsVisible)
                 }
+            } else {
+                VStack(spacing: 0) {
+                    videoArea
+                    controlsBar
+                }
+                .frame(minWidth: 720, minHeight: 480)
             }
-            .frame(minWidth: 640, minHeight: 360)
-
-            controls
-                .padding()
-                .background(.regularMaterial)
         }
-        .frame(minWidth: 720, minHeight: 480)
         .navigationTitle(playerViewModel.videoTitle)
+        // Track full-screen state so the layout and auto-hide follow it.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullScreen = true
+            showControlsTemporarily()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            isFullScreen = false
+            hideControlsTask?.cancel()
+            controlsVisible = true
+        }
         .onChange(of: playerViewModel.translationTargetIdentifier) { _, _ in
             playerViewModel.startSubtitleTranslation()
         }
@@ -42,6 +55,74 @@ struct ContentView: View {
         .onChange(of: playerViewModel.subtitleCues) { _, _ in
             // Newly generated cues: retranslate if a target is active.
             playerViewModel.startSubtitleTranslation()
+        }
+    }
+
+    private var videoArea: some View {
+        ZStack(alignment: .bottom) {
+            MetalVideoView(playerViewModel: playerViewModel)
+                .background(Color.black)
+                .overlay {
+                    if isDropTargeted {
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(Color.accentColor, lineWidth: 4)
+                            .background(Color.accentColor.opacity(0.12))
+                            .allowsHitTesting(false)
+                    }
+                }
+
+            if let text = playerViewModel.subtitleText(at: playerViewModel.currentTime) {
+                Text(text)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+                    // Sit above the controls bar when it's showing.
+                    .padding(.bottom, isFullScreen && controlsVisible ? 140 : 24)
+                    .padding(.horizontal, 40)
+                    .shadow(radius: 2)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(minWidth: 640, minHeight: 360)
+        // Any mouse movement over the picture reveals the controls again.
+        .onContinuousHover { phase in
+            if case .active = phase { showControlsTemporarily() }
+        }
+        // Drag a video file straight onto the picture to open it.
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                Task { @MainActor in
+                    playerViewModel.load(url: url)
+                }
+            }
+            return true
+        }
+    }
+
+    private var controlsBar: some View {
+        controls
+            .padding()
+            .background(.regularMaterial)
+    }
+
+    /// Shows the controls and (in full screen) schedules them to fade out
+    /// after a few seconds of no mouse movement.
+    private func showControlsTemporarily() {
+        hideControlsTask?.cancel()
+        if !controlsVisible {
+            withAnimation(.easeOut(duration: 0.2)) { controlsVisible = true }
+        }
+        guard isFullScreen else { return }
+        hideControlsTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, isFullScreen else { return }
+            withAnimation(.easeOut(duration: 0.4)) { controlsVisible = false }
+            NSCursor.setHiddenUntilMouseMoves(true)
         }
     }
 
@@ -106,6 +187,28 @@ struct ContentView: View {
                     .font(.caption)
                     .monospacedDigit()
                     .frame(minWidth: 100, alignment: .trailing)
+
+                // Volume (also on ↑/↓ and M via the Playback menu).
+                Button {
+                    playerViewModel.toggleMute()
+                } label: {
+                    Image(systemName: playerViewModel.isMuted || playerViewModel.volume == 0
+                          ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                        .frame(width: 18)
+                }
+                .help("Mute (M)")
+
+                Slider(value: $playerViewModel.volume, in: 0...100)
+                    .frame(width: 80)
+                    .disabled(playerViewModel.isMuted)
+
+                Button {
+                    WindowControl.toggleFullScreen()
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .frame(width: 18)
+                }
+                .help("Full screen (F)")
             }
 
             Divider()
@@ -299,5 +402,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(playerViewModel: PlayerViewModel())
 }

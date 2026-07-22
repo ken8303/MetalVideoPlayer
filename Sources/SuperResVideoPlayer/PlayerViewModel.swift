@@ -26,6 +26,18 @@ final class PlayerViewModel: ObservableObject {
     @Published var videoTitle: String = "No video loaded"
     @Published var isScrubbing = false
 
+    /// Playback volume, 0...100 (mpv's software volume). Persisted; mute is
+    /// deliberately not (a fresh launch shouldn't start silent).
+    @Published var volume: Double = 100 {
+        didSet {
+            mpv.setVolume(volume)
+            Defaults.set(volume, .volume)
+        }
+    }
+    @Published var isMuted = false {
+        didSet { mpv.setMuted(isMuted) }
+    }
+
     /// Set when a file fails to open/decode, so the UI can say why nothing
     /// is playing instead of silently showing a black view.
     @Published var playbackErrorMessage: String?
@@ -53,20 +65,34 @@ final class PlayerViewModel: ObservableObject {
 
     /// AI Image Enhancer: same-resolution cleanup applied before Super
     /// Resolution. See `EnhancerEngine` for the three implementations.
-    @Published var imageEnhancementEnabled = false
-    @Published var enhancementEngine: EnhancerEngine = .classic
-    @Published var enhancementStrength: Double = 0.5
+    /// These enhancement/quality settings persist across launches (see
+    /// `Defaults` and `restoreSettings()`).
+    @Published var imageEnhancementEnabled = false {
+        didSet { Defaults.set(imageEnhancementEnabled, .imageEnhancementEnabled) }
+    }
+    @Published var enhancementEngine: EnhancerEngine = .classic {
+        didSet { Defaults.set(enhancementEngine.rawValue, .enhancementEngine) }
+    }
+    @Published var enhancementStrength: Double = 0.5 {
+        didSet { Defaults.set(enhancementStrength, .enhancementStrength) }
+    }
 
     /// Toggle for enabling/disabling MetalFX Super Resolution upscaling.
-    @Published var superResolutionEnabled = true
+    @Published var superResolutionEnabled = true {
+        didSet { Defaults.set(superResolutionEnabled, .superResolutionEnabled) }
+    }
 
     /// Target upscale factor applied by MetalFX when Super Resolution is on.
-    @Published var upscaleFactor: Double = 1.5
+    @Published var upscaleFactor: Double = 1.5 {
+        didSet { Defaults.set(upscaleFactor, .upscaleFactor) }
+    }
 
     /// AI Frame Interpolation smoothing multiplier: 1 = off, 2 = one
     /// synthesized in-between frame per real pair (native MetalFX), 3 = two
     /// synthesized frames per real pair (custom warp fallback).
-    @Published var frameInterpolationMultiplier: Int = 1
+    @Published var frameInterpolationMultiplier: Int = 1 {
+        didSet { Defaults.set(frameInterpolationMultiplier, .frameInterpolationMultiplier) }
+    }
 
     /// Set by `Renderer` if MetalFX spatial scaling is unsupported on this GPU.
     @Published var superResolutionUnsupported = false
@@ -83,9 +109,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var subtitleGenerationProgress: Double = 0
     @Published var subtitleErrorMessage: String?
 
-    /// Spoken language to transcribe. Defaults to the system's current
-    /// locale if the Speech framework supports it on this Mac.
-    @Published var subtitleLanguage: Locale = .current
+    /// Spoken language to transcribe. Restored from the last session if it's
+    /// still supported, else the system's current locale.
+    @Published var subtitleLanguage: Locale = .current {
+        didSet { Defaults.set(subtitleLanguage.identifier, .subtitleLanguage) }
+    }
 
     /// Locales this Mac's Speech framework can recognize, for the language picker.
     private(set) var availableSubtitleLocales: [Locale] = []
@@ -132,17 +160,71 @@ final class PlayerViewModel: ObservableObject {
     /// directly (via the settings snapshot pushed in MetalVideoView).
     let mpv = MPVPlayer()
 
+    /// Keys + typed accessors for the settings that persist across launches.
+    enum Defaults: String {
+        case imageEnhancementEnabled, enhancementEngine, enhancementStrength
+        case superResolutionEnabled, upscaleFactor, frameInterpolationMultiplier
+        case volume, subtitleLanguage
+
+        static func set(_ value: Any, _ key: Defaults) {
+            UserDefaults.standard.set(value, forKey: key.rawValue)
+        }
+        static func has(_ key: Defaults) -> Bool {
+            UserDefaults.standard.object(forKey: key.rawValue) != nil
+        }
+        static func double(_ key: Defaults) -> Double { UserDefaults.standard.double(forKey: key.rawValue) }
+        static func integer(_ key: Defaults) -> Int { UserDefaults.standard.integer(forKey: key.rawValue) }
+        static func bool(_ key: Defaults) -> Bool { UserDefaults.standard.bool(forKey: key.rawValue) }
+        static func string(_ key: Defaults) -> String? { UserDefaults.standard.string(forKey: key.rawValue) }
+    }
+
+    /// Restores persisted quality/enhancement settings. Property observers
+    /// don't fire during `init`, so anything that must reach mpv (volume) is
+    /// pushed explicitly afterwards.
+    private func restoreSettings() {
+        if Defaults.has(.imageEnhancementEnabled) {
+            imageEnhancementEnabled = Defaults.bool(.imageEnhancementEnabled)
+        }
+        if let raw = Defaults.string(.enhancementEngine), let engine = EnhancerEngine(rawValue: raw) {
+            enhancementEngine = engine
+        }
+        if Defaults.has(.enhancementStrength) {
+            enhancementStrength = Defaults.double(.enhancementStrength)
+        }
+        if Defaults.has(.superResolutionEnabled) {
+            superResolutionEnabled = Defaults.bool(.superResolutionEnabled)
+        }
+        if Defaults.has(.upscaleFactor) {
+            // Guard against a value outside the picker's options.
+            let saved = Defaults.double(.upscaleFactor)
+            if [1.3, 1.5, 2.0].contains(saved) { upscaleFactor = saved }
+        }
+        if Defaults.has(.frameInterpolationMultiplier) {
+            let saved = Defaults.integer(.frameInterpolationMultiplier)
+            if (1...3).contains(saved) { frameInterpolationMultiplier = saved }
+        }
+        if Defaults.has(.volume) {
+            volume = min(100, max(0, Defaults.double(.volume)))
+        }
+    }
+
     init() {
         let supported = SubtitleGenerator.supportedLocales
         availableSubtitleLocales = supported
         let current = Locale.current
-        // Assign the matched *supported* Locale instance (not `current`):
-        // Locale equality is stricter than identifier equality, and the
-        // Picker's tag matching needs `subtitleLanguage` to equal one of
-        // the instances in `availableSubtitleLocales`.
-        subtitleLanguage = supported.first(where: { $0.identifier == current.identifier })
+        // Prefer the language used last time, else the system locale —
+        // assigning the matched *supported* Locale instance (not `current`),
+        // since Locale equality is stricter than identifier equality and the
+        // Picker's tag matching needs an instance from `availableSubtitleLocales`.
+        let preferredIdentifier = Defaults.string(.subtitleLanguage) ?? current.identifier
+        subtitleLanguage = supported.first(where: { $0.identifier == preferredIdentifier })
+            ?? supported.first(where: { $0.identifier == current.identifier })
             ?? supported.first
             ?? current
+
+        restoreSettings()
+        // Observers don't fire during init — push the restored volume through.
+        mpv.setVolume(volume)
 
         // mpv event callbacks (all delivered on the main queue).
         mpv.onTimeChanged = { [weak self] seconds in
@@ -309,6 +391,21 @@ final class PlayerViewModel: ObservableObject {
     func seek(toSeconds seconds: Double) {
         mpv.seek(to: seconds)
         currentTime = seconds
+    }
+
+    /// Relative seek used by the ←/→ keyboard shortcuts.
+    func step(by seconds: Double) {
+        guard duration > 0 else { return }
+        seek(toSeconds: min(max(0, currentTime + seconds), duration))
+    }
+
+    func adjustVolume(by delta: Double) {
+        volume = min(100, max(0, volume + delta))
+        if volume > 0, isMuted { isMuted = false }   // nudging volume unmutes
+    }
+
+    func toggleMute() {
+        isMuted.toggle()
     }
 
     // MARK: AI Subtitle Generator
