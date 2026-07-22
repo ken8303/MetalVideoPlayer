@@ -178,9 +178,13 @@ final class PlayerViewModel: ObservableObject {
         static func string(_ key: Defaults) -> String? { UserDefaults.standard.string(forKey: key.rawValue) }
     }
 
-    /// Restores persisted quality/enhancement settings. Property observers
-    /// don't fire during `init`, so anything that must reach mpv (volume) is
-    /// pushed explicitly afterwards.
+    /// Restores persisted quality/enhancement settings.
+    ///
+    /// Called as a method from `init` (not by direct assignment inside it),
+    /// so the property observers *do* fire — each restored value writes
+    /// itself straight back to defaults, which is harmless, and `volume`
+    /// reaches mpv on its own. The explicit `mpv.setVolume` in `init` is
+    /// belt-and-braces for the case where nothing was persisted.
     private func restoreSettings() {
         if Defaults.has(.imageEnhancementEnabled) {
             imageEnhancementEnabled = Defaults.bool(.imageEnhancementEnabled)

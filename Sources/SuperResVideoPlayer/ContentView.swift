@@ -34,6 +34,14 @@ struct ContentView: View {
             }
         }
         .navigationTitle(playerViewModel.videoTitle)
+        // Opening a video from Finder ("Open With", or dropping it on the
+        // Dock icon) delivers the file here — without this the app would
+        // launch but never load the file, since Info.plist advertises
+        // CFBundleDocumentTypes.
+        .onOpenURL { url in
+            guard url.isFileURL else { return }
+            playerViewModel.load(url: url)
+        }
         // Track full-screen state so the layout and auto-hide follow it.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
             isFullScreen = true
@@ -108,6 +116,20 @@ struct ContentView: View {
         controls
             .padding()
             .background(.regularMaterial)
+            // Keep the bar alive while the pointer is over it — otherwise
+            // the auto-hide timer fires mid-interaction (e.g. while dragging
+            // the volume slider in full screen) and the controls vanish.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active:
+                    hideControlsTask?.cancel()
+                    if !controlsVisible {
+                        withAnimation(.easeOut(duration: 0.2)) { controlsVisible = true }
+                    }
+                case .ended:
+                    showControlsTemporarily()   // restart the countdown on exit
+                }
+            }
     }
 
     /// Shows the controls and (in full screen) schedules them to fade out
@@ -240,7 +262,7 @@ struct ContentView: View {
             if playerViewModel.imageEnhancementEnabled && playerViewModel.enhancementEngine == .max {
                 Text(NeuralEnhancer.isModelAvailable
                      ? "Max (Real-ESRGAN) applies during export — playback previews with the Neural engine."
-                     : "Max needs the Real-ESRGAN model: run `bash convert-model.sh` once to install it.")
+                     : "Max needs an optional Real-ESRGAN model that isn't installed. Use Classic or Neural, which need nothing extra.")
                     .font(.caption)
                     .foregroundStyle(NeuralEnhancer.isModelAvailable ? Color.secondary : Color.orange)
             }

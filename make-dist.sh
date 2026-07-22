@@ -25,17 +25,45 @@ swift build -c release -Xswiftc -gnone
 BIN=.build/release/SuperResVideoPlayer
 BUNDLE_SRC=.build/release/SuperResVideoPlayer_SuperResVideoPlayer.bundle
 DIST=dist
-APP="$DIST/SuperResVideoPlayer.app"
+REPO="$PWD"
+
+# IMPORTANT: stage and sign OUTSIDE the repo.
+# If the project lives in an iCloud-synced folder (Desktop & Documents), the
+# file provider continuously re-attaches xattrs (com.apple.fileprovider.fpfs,
+# com.apple.FinderInfo) to anything created there. codesign then refuses the
+# bundle with "resource fork, Finder information, or similar detritus not
+# allowed", and clearing the attributes is a race you can't win. /tmp isn't
+# managed by the file provider, so the bundle stays clean.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/SuperResVideoPlayerDist.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+APP="$STAGE/SuperResVideoPlayer.app"
 FRAMEWORKS="$APP/Contents/Frameworks"
 HELPERS="$APP/Contents/Helpers"
 
 rm -rf "$DIST"
+mkdir -p "$DIST"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$FRAMEWORKS" "$HELPERS"
 
 cp "$BIN" "$APP/Contents/MacOS/SuperResVideoPlayer"
 cp Info.plist "$APP/Contents/Info.plist"
 if [ -d "$BUNDLE_SRC" ]; then
   cp -R "$BUNDLE_SRC" "$APP/Contents/Resources/"
+fi
+
+# --- App icon ----------------------------------------------------------
+# Build AppIcon.icns from the 1024px master (no Xcode asset catalog needed).
+if [ -f AppIcon.png ]; then
+  echo "==> Building app icon…"
+  ICONSET="$(mktemp -d)/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for sz in 16 32 128 256 512; do
+    sips -z $sz $sz AppIcon.png --out "$ICONSET/icon_${sz}x${sz}.png"     > /dev/null 2>&1
+    sips -z $((sz*2)) $((sz*2)) AppIcon.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" > /dev/null 2>&1
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  rm -rf "$ICONSET"
+else
+  echo "warning: AppIcon.png missing — the app will use the generic icon"
 fi
 
 # Optional helper CLIs. The app degrades gracefully without them (subtitles
@@ -124,23 +152,60 @@ done
 for tool in "$HELPERS"/*; do
   [ -f "$tool" ] && codesign --force --sign - "$tool" > /dev/null 2>&1
 done
-codesign --force --sign - "$APP"
+# Strip everything codesign considers "detritus" before signing: extended
+# attributes, AppleDouble sidecars (._foo), and .DS_Store files. Tools like
+# sips/iconutil and plain copies can leave these behind, and codesign then
+# fails with "resource fork, Finder information, or similar detritus".
+echo "==> Cleaning bundle metadata…"
+find "$APP" -name '._*' -delete 2>/dev/null || true
+find "$APP" -name '.DS_Store' -delete 2>/dev/null || true
+dot_clean -m "$APP" 2>/dev/null || true
+xattr -cr "$APP" 2>/dev/null || true
 
-echo "==> Verifying…"
-codesign --verify --deep "$APP" && echo "    signature OK"
-# Smoke-test that the main binary resolves its libraries from the bundle.
-if otool -L "$APP/Contents/MacOS/SuperResVideoPlayer" | grep -q "/opt/homebrew"; then
-  echo "error: main binary still references /opt/homebrew — bundling incomplete"
+if ! codesign --force --sign - "$APP" 2>/tmp/codesign.err; then
+  echo "error: codesign failed:"
+  cat /tmp/codesign.err
+  echo
+  echo "Remaining extended attributes (these are the likely culprit):"
+  xattr -lr "$APP" | head -40
   exit 1
 fi
 
+echo "==> Verifying…"
+codesign --verify --deep "$APP" && echo "    signature OK"
+
+# Nothing in the bundle may point at Homebrew, or it won't run elsewhere.
+LEAKS=0
+for target in "$APP/Contents/MacOS/SuperResVideoPlayer" "$FRAMEWORKS"/*.dylib "$HELPERS"/*; do
+  [ -f "$target" ] || continue
+  if otool -L "$target" 2>/dev/null | tail -n +2 | grep -q "/opt/homebrew\|/usr/local/"; then
+    echo "error: $(basename "$target") still references a local Homebrew path"
+    LEAKS=1
+  fi
+done
+if [ "$LEAKS" -ne 0 ]; then
+  echo "Bundling incomplete — the app would fail on a machine without Homebrew."
+  exit 1
+fi
+echo "    no Homebrew references — bundle is self-contained"
+
+# Zip from the clean staging area (so the archive carries no file-provider
+# metadata), then copy the results back into the repo's dist/ folder.
 echo "==> Zipping…"
-ditto -c -k --keepParent "$APP" "$DIST/SuperResVideoPlayer.zip"
+ditto -c -k --keepParent --sequesterRsrc "$APP" "$STAGE/SuperResVideoPlayer.zip"
+
+cp "$STAGE/SuperResVideoPlayer.zip" "$DIST/"
+# A copy of the signed app for local testing. (Copying it back into an
+# iCloud-synced folder may re-attach xattrs; that's harmless for running it,
+# and the zip above is the artifact you actually distribute.)
+ditto "$APP" "$DIST/SuperResVideoPlayer.app"
 
 echo ""
 echo "Done:"
-echo "  $APP"
+echo "  $DIST/SuperResVideoPlayer.app   <- for local testing"
 echo "  $DIST/SuperResVideoPlayer.zip   <- share this"
 echo ""
-echo "Tell recipients: Apple Silicon + macOS 26 required; on first launch"
-echo "right-click the app and choose Open (it isn't notarized)."
+echo "Recipients need: Apple Silicon Mac on macOS 27. Nothing to install."
+echo "First launch: right-click the app > Open (it is ad-hoc signed, not"
+echo "notarized). If macOS says it is damaged, they should run:"
+echo "  xattr -dc /Applications/SuperResVideoPlayer.app"

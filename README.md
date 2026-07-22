@@ -41,6 +41,21 @@ real time:
   synthesized frames per second, which interpolation engine is active) so
   you can verify the enhancements are actually running.
 
+## Download
+
+Grab the latest `SuperResVideoPlayer.zip` from the
+[Releases page](../../releases/latest) — the app is self-contained, so
+there's nothing else to install.
+
+1. Unzip and drag the app to Applications.
+2. **Right-click → Open** the first time (the build is ad-hoc signed, not
+   notarized, so a plain double-click is blocked once).
+3. If macOS says the app is damaged:
+   `xattr -dc /Applications/SuperResVideoPlayer.app`
+
+Needs an Apple Silicon Mac on macOS 27. Everything below is for building
+from source instead.
+
 ## Requirements
 
 - Apple Silicon Mac (MetalFX requires an Apple-family GPU).
@@ -50,10 +65,14 @@ real time:
   adds the improved on-device translation model.
 - Xcode 27+ / a Swift 6.2+ toolchain to build.
 - **libmpv**: `brew install mpv`
-- Optional: `brew install ffmpeg` — used only to extract audio for subtitle
-  generation from containers Apple's Speech framework can't read (MKV,
-  WebM, ...), and to repackage such containers for export. Playback itself
-  never needs it.
+- **ffmpeg**: `brew install ffmpeg` — required for *subtitle generation on
+  video files* (the speech engines read via `AVAudioFile`, which can't
+  demux video containers, so the audio track is extracted to a temporary
+  16 kHz WAV first), and for exporting containers `AVAssetReader` can't
+  read (MKV/WebM) or decode (10-bit HEVC).
+  **Not** needed for playback, Super Resolution, frame interpolation, the
+  image enhancer, or subtitle translation. In practice `brew install mpv`
+  already pulls ffmpeg in as a dependency.
 - Subtitle translation requires **Apple Intelligence** to be enabled
   (System Settings > Apple Intelligence & Siri).
 - The **Max** image-enhancer engine requires the Real-ESRGAN Core ML model.
